@@ -1,0 +1,10 @@
+node_modules/
+*.log
+*.zip
+*.patch
+reports/
+runs/
+.DS_Store
+Thumbs.db
+_local-review-input/
+codex-safety-canary-alpha*.diff
