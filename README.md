@@ -4,8 +4,6 @@
   <img src="docs/assets/codex-safety-canary-hero.png" alt="Yellow canary beside a wooden sandbox frame" width="760">
 </p>
 
-The visual metaphor reflects the tool's scoped boundary checks for Codex sandbox diagnostics.
-
 A local diagnostic that checks whether your current Codex setup actually enforces the Windows sandbox boundary and how your user-level execpolicy rules classify common deletion commands.
 
 It uses only disposable synthetic files. It does **not** open, scan, modify, or delete files from a real project.
