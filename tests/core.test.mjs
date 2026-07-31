@@ -36,6 +36,8 @@ import {
   parseStandaloneReleaseVersion,
   summarizeAssessment,
   summarizeExecutableBundles,
+  canonicalExistingPathKey,
+  resolveFilesystemIdentity,
   detectAccessDenied,
   canonicalizeWindowsPath,
   sameWindowsPath,
@@ -2647,12 +2649,17 @@ test('standalone current symlink or junction is deduplicated with its release ta
     t.skip(`symlink/junction unavailable: ${error.message}`);
     return;
   }
+  const currentExecutable = path.join(current, 'bin', 'codex.exe');
+  const currentIdentity = resolveFilesystemIdentity(current);
+  const releaseIdentity = resolveFilesystemIdentity(release);
+  assert.equal(currentIdentity.linkType, 'SYMLINK_OR_JUNCTION');
+  assert.equal(currentIdentity.key, releaseIdentity.key);
+  assert.equal(canonicalExistingPathKey(currentExecutable), canonicalExistingPathKey(path.join(release, 'bin', 'codex.exe')));
   const packages = discoverStandalonePackages(codexHome);
   assert.equal(packages.length, 1);
   assert.equal(packages[0].releaseVersion, '0.146.0');
   assert.deepEqual([...packages[0].sources].sort(), ['current', 'release']);
   assert.equal(packages[0].aliases.length, 1);
-  const currentExecutable = path.join(current, 'bin', 'codex.exe');
   const bundle = inspectCodexBundle(currentExecutable, {
     codexHome,
     activeVersion: 'codex-cli 0.146.0',
@@ -2664,6 +2671,92 @@ test('standalone current symlink or junction is deduplicated with its release ta
   assert.equal(bundle.probeEligible, true);
   assert.equal(bundle.helperResolution, 'NOT_TESTED');
   assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('standalone directory symlink resolves to one release package', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-symlink-'));
+  const standaloneRoot = path.join(codexHome, 'packages', 'standalone');
+  const release = path.join(standaloneRoot, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(standaloneRoot, 'current');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-resources'), { recursive: true });
+  fs.writeFileSync(path.join(release, 'bin', 'codex.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 1);
+  assert.deepEqual([...packages[0].sources].sort(), ['current', 'release']);
+  assert.equal(packages[0].aliases.length, 1);
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('standalone current copy and same-version release remain separate filesystem identities', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-copy-'));
+  const standaloneRoot = path.join(codexHome, 'packages', 'standalone');
+  const current = path.join(standaloneRoot, 'current');
+  const release = path.join(standaloneRoot, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  for (const directory of [current, release]) {
+    fs.mkdirSync(path.join(directory, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(directory, 'codex-resources'), { recursive: true });
+    fs.writeFileSync(path.join(directory, 'bin', 'codex.exe'), 'synthetic');
+    fs.writeFileSync(path.join(directory, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+    fs.writeFileSync(path.join(directory, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  }
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 2);
+  assert.notEqual(canonicalExistingPathKey(current), canonicalExistingPathKey(release));
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('same-version standalone release directories remain separate without filesystem identity', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-same-version-'));
+  const releases = path.join(codexHome, 'packages', 'standalone', 'releases');
+  for (const name of ['0.146.0-x86_64-pc-windows-msvc', '0.146.0-aarch64-pc-windows-msvc']) {
+    const directory = path.join(releases, name);
+    fs.mkdirSync(path.join(directory, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(directory, 'bin', 'codex.exe'), 'synthetic');
+  }
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 2);
+  assert.deepEqual(packages.map((entry) => entry.releaseVersion), ['0.146.0', '0.146.0']);
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('Windows namespace and case variants retain the same existing-path identity', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-filesystem-identity-'));
+  const file = path.join(temp, 'MixedCase', 'codex.exe');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, 'synthetic');
+  const baseline = canonicalExistingPathKey(file);
+  if (process.platform === 'win32') {
+    assert.equal(canonicalExistingPathKey(`\\\\?\\${file}`), baseline);
+    assert.equal(canonicalExistingPathKey(file.toUpperCase()), baseline);
+  } else {
+    assert.equal(canonicalExistingPathKey(file), baseline);
+  }
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
+test('broken standalone current link is conservative and does not merge with a release', (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-broken-current-'));
+  const standaloneRoot = path.join(codexHome, 'packages', 'standalone');
+  const release = path.join(standaloneRoot, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(standaloneRoot, 'current');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(release, 'bin', 'codex.exe'), 'synthetic');
+  try {
+    fs.symlinkSync(path.join(standaloneRoot, 'missing-release'), current, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    fs.rmSync(codexHome, { recursive: true, force: true });
+    t.skip(`broken link unavailable: ${error.message}`);
+    return;
+  }
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 1);
+  assert.deepEqual(packages[0].sources, ['release']);
+  assert.notEqual(canonicalExistingPathKey(current), canonicalExistingPathKey(release));
   fs.rmSync(codexHome, { recursive: true, force: true });
 });
 
@@ -2832,6 +2925,16 @@ test('bundle statistics deduplicate current and release aliases by executable re
   assert.equal(statistics.logicalExecutableCount, 1);
   assert.equal(statistics.discoveredPathCount, 2);
   assert.equal(statistics.aliasPathCount, 1);
+  const reversedStatistics = summarizeExecutableBundles([...bundles].reverse());
+  assert.deepEqual({
+    logicalExecutableCount: reversedStatistics.logicalExecutableCount,
+    discoveredPathCount: reversedStatistics.discoveredPathCount,
+    aliasPathCount: reversedStatistics.aliasPathCount,
+  }, {
+    logicalExecutableCount: statistics.logicalExecutableCount,
+    discoveredPathCount: statistics.discoveredPathCount,
+    aliasPathCount: statistics.aliasPathCount,
+  });
   assert.deepEqual(statistics.discoveredPaths.map((value) => path.normalize(value)).sort(), bundles.map((bundle) => path.normalize(bundle.executablePath)).sort());
   const summary = summarizeAssessment({ config: { warnings: [] }, matchingCompleteBundles: bundles }, [], null, {
     assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY,
