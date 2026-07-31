@@ -43,13 +43,13 @@ The Windows launcher can use the Node executable bundled inside Codex when `node
 
 ## Why does the Canary say that the active CLI bundle is incomplete?
 
-The `codex.exe` found through `PATH` does not have the required Windows sandbox helper and command-runner executables beside it. The sandbox subcommand may still appear in help output even though its runtime setup cannot start.
+The Canary distinguishes two layouts. In a classic layout, the required Windows sandbox helper and command-runner executables sit beside `codex.exe`. In a standalone layout, matching helpers live under the package's `codex-resources` directory instead. A complete standalone resource layout is not reported as an incomplete bundle merely because runtime resolution has not yet been tested; resource presence, helper resolution, runtime startup, and boundary proof remain separate states.
 
-## Is it safe to use a complete bundle found elsewhere?
+## Is it safe to use a probe-eligible executable found elsewhere?
 
-The Canary prefers a complete bundle with the same Codex version. If none exists, it may offer a newer complete bundle only when that bundle's own `codex sandbox --help` check succeeds. It displays both versions and the exact executable path, requires consent, and runs a harmless sandbox smoke test before any deletion probe.
+The active PATH CLI remains the recommended default. If multiple probe-eligible local executables exist, the Canary shows a numbered choice with each source, version, exact path, resource layout, and sandbox status. A same-version or newer alternative must be selected explicitly, and the selected executable runs a harmless sandbox smoke test before any deletion probe.
 
-A newer-bundle result applies only to that alternative executable. It does **not** prove that the incomplete active CLI found through `PATH` is protected. The Canary never copies files, alters `PATH`, or modifies Codex.
+Any result from an executable other than the active PATH CLI applies only to that alternative executable, even when both executables report the same Codex version. It does **not** prove that the incomplete active CLI found through `PATH` is protected. A newer alternative additionally carries a version-mismatch warning. The Canary never copies files, alters `PATH`, or modifies Codex.
 
 ## Why is there a smoke test before the deletion probes?
 
@@ -57,12 +57,12 @@ A sandbox command can exist while its helper is missing or unresolvable. The smo
 
 ## Does the Canary search all of my disk for Codex executables?
 
-No. It searches only the active `PATH` command and the known local Codex installation roots under `%LOCALAPPDATA%\OpenAI\Codex\bin` and `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`.
+No. It checks the active `PATH` command plus the known roots `%LOCALAPPDATA%\OpenAI\Codex\bin`, `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`, `%CODEX_HOME%\packages\standalone\current`, and `%CODEX_HOME%\packages\standalone\releases\*`.
 
 
-## Why is a newer complete bundle offered instead of silently used?
+## Why is a newer probe-eligible executable offered instead of silently used?
 
-A split installation can leave an incomplete active CLI beside a newer complete bundle installed by the Codex app. Silently substituting versions would make the report misleading. The Canary therefore asks first and labels the result as an alternative-bundle test.
+A split installation can leave an incomplete active CLI beside a newer probe-eligible executable installed by the Codex app. Silently substituting versions would make the report misleading. The Canary therefore asks first and labels the result as an alternative-bundle test.
 
 
 ## Why does the Canary need an inside-workspace deletion probe?
@@ -71,7 +71,7 @@ It is the positive control for `workspace-write`. If the sandbox blocks all writ
 
 ## Can a command failure count as sandbox protection?
 
-Only when the file remains and the result contains recognizable access-denial evidence. Syntax errors, missing programs, malformed commands, timeouts, and unrelated failures are reported as `TEST_ERROR`.
+Not by itself. An outside `PASS` requires a controlled deletion command that started and actually attempted the operation, successful host calibration for the same method, a pre-existing expected outside file that remained afterward, unambiguous matching target identity, and supported structured denial evidence. Generic or unrelated access-denied text, a merely retained file, syntax or argument errors, wrapper or network failures, missing commands, timeouts, and other ambiguous evidence are `TEST_ERROR`, not sandbox protection. A successful individual method also does not replace the complete structured PowerShell, cmd.exe, and Node.js matrix (`3/3`) required for a boundary `PASS`.
 
 
 ## Why are PowerShell, cmd.exe, and Node.js each tested twice?
@@ -89,8 +89,8 @@ A split installation can leave the `codex.exe` resolved through `PATH` incomplet
 
 ## What should I do when the active CLI bundle is incomplete?
 
-Update or reinstall Codex using the official installer so `codex.exe`, `codex-windows-sandbox-setup.exe`, and `codex-command-runner.exe` are installed together. Then open a new non-administrator PowerShell session and rerun the Canary. Do not manually copy helper executables between different versions.
+First check which layout the report identified. For an incomplete classic layout or a partial or missing standalone resource layout, update or reinstall Codex through the official distribution channel, then rerun the Canary from a new non-administrator PowerShell session. If the standalone resource layout is complete but helper resolution and runtime startup are `NOT_TESTED`, run the controlled preflight or optional live probes instead; resource presence alone is not runtime proof, but it is not a reason to reinstall. For an actual helper or runtime failure, follow the specific diagnostic. Never copy helper executables between versions manually.
 
 ## Which report should I attach to a public support issue?
 
-Use the automatically generated `-support.txt` report. It omits usernames, executable paths, project paths, credential paths, and raw configuration contents. Review it before posting because no automatic redaction can guarantee that every future diagnostic string is non-sensitive. The detailed report is intended for local diagnosis.
+Use the automatically generated `-support.txt` report. It removes local usernames, absolute local paths, credential paths, and raw configuration contents while retaining diagnostic version, installation, runtime, and security-status information needed for support. “Share-safe” means risk-reduced, not anonymous or secret. Review it before posting because no automatic redaction can guarantee that every future diagnostic string is non-sensitive. The detailed report is intended for local diagnosis.

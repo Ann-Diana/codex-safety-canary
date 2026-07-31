@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.1.0-alpha.11 – 2026-07-31
+
+### Added
+
+- Adds read-only discovery for standalone installations and complete alternative Codex bundles under the active `PATH` plus `%LOCALAPPDATA%\OpenAI\Codex\bin`, `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`, `%CODEX_HOME%\packages\standalone\current`, and `%CODEX_HOME%\packages\standalone\releases\*`.
+- Adds explicit Guided and Sandbox-only selection among deduplicated active, same-version, and newer probe-eligible executables while keeping the active PATH CLI recommended and never substituting an alternative silently.
+- Adds target-scoped diagnostics for standalone resources, setup-helper resolution, command-runner process creation, runtime startup, Doctor contradictions, and sandbox-boundary evidence.
+
+### Changed
+
+- Separates resource layout, helper resolution, runtime startup, and boundary proof so file presence is never reported as runtime or protection evidence and complete but untested standalone resources do not trigger an unnecessary reinstall recommendation.
+- Resolves launcher, standalone `current`, and release paths through realpaths, deduplicates aliases, preserves their source metadata, and derives the package version from the real release target.
+- Keeps the active PATH CLI and every separately selected executable as independent diagnostic targets across console, TXT, JSON, and share-safe reports; same-version and newer alternative results apply only to the selected executable.
+- Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result; `codex doctor --json` remains non-blocking read-only evidence.
+- Writes full Sandbox-only reports when live probes are unavailable, while keeping unavailable, explicitly declined, and intentionally unassessed outcomes distinct.
+
+### Security
+
+- Requires successful host preflight, successful per-method host calibration, smoke startup, clean completion, and an exact PowerShell, cmd.exe, and Node.js runtime matrix (`3/3`) before any boundary PASS; missing, contradictory, ambiguous, or incomplete evidence fails closed.
+- Binds denial evidence to command start, attempted operation, independently reported target identity, before/after file state, error class, HResult, and native Windows error code instead of accepting generic access-denied text.
+- Uses `System.IO.File.Delete` for the PowerShell boundary probe and accepts an outside denial only with a matching `System.UnauthorizedAccessException`, native Win32 error code `5`, or target-bound `PermissionDenied`; `InvalidArgument`, generic ErrorRecords, and message-only access-denied text cannot produce PASS.
+- Hardens Windows target canonicalization for drive, UNC, and namespace paths and preserves the separate PowerShell `Remove-Item` execpolicy coverage check.
+- Applies recursive final share-safe redaction, fail-closed handling of unknown quoted and unquoted Windows paths, and rejection of residual path fragments after spaces, commas, semicolons, apostrophes, or known-root placeholder replacement.
+- Clarifies the share-safe badge, TXT footer, JSON notice, README, FAQ, and security guidance: local usernames, absolute paths, credential paths, and raw configuration contents are removed, while diagnostic version, installation, runtime, and security-status information is retained and must be reviewed before public sharing.
+- Hardens the Alpha 11 candidate through adversarial regression tests and repeated read-only Codex Security scans, including fixes for incomplete-run PASS aggregation, denial evidence not bound to its operation and target, incomplete local-path redaction, ambiguous PowerShell error classification, and overbroad share-safe communication.
+- Removes misleading boundary part-pass terminology: only a complete structured runtime matrix (`3/3`) can produce PASS, while incomplete technical evidence is `TEST ERROR / INCOMPLETE` and a declined assessment remains `PARTIAL` with boundary `NOT TESTED`.
+- Requires controlled evidence that binds the selected executable, runtime stage, and command-runner component before `CreateProcessWithLogonW` failures can confirm helper resolution; unbound or mixed diagnostic text remains fail-closed.
+- Parses execpolicy JSON through recognized aggregate fields and explicit matched-rule structures, computes supported rule fallbacks deterministically, and exposes unknown or contradictory schemas as `UNKNOWN_SCHEMA` without treating them as `OK`, `NO_MATCH`, or sandbox-boundary evidence.
+- Gives a confirmed controlled outside-file deletion priority over additional incomplete or failed sibling probes, while retaining those probe errors as separate report evidence instead of obscuring the boundary gap.
+- Clarifies that an outside denial requires the complete method-specific structured evidence chain; generic access-denied text and a merely retained file are not proof of sandbox protection.
+- Evaluates cleanup success from explicit structured state rather than free message text; missing, failed, not-run, legacy-only, unknown, or contradictory cleanup evidence blocks boundary PASS.
+- Includes all nine Alpha 11 workflow screenshots in the README with result-oriented alternative text, including explicit selected-executable scope for alternative-bundle evidence.
+- Removes unnecessary C2PA/JUMBF provenance metadata from the public hero while preserving its dimensions and decoded pixels.
+
+### Validation
+
+- Validated the Windows sandbox boundary against the separately selected `codex-cli 0.146.0-alpha.3.1` executable with successful host preflight, PowerShell/cmd.exe/Node.js host calibration, smoke startup, and complete runtime coverage (`3/3`). The retained PowerShell outside file produced `System.UnauthorizedAccessException`, HResult `-2147024891`, and native Win32 error code `5`; cmd.exe passed its outside check, and Node.js produced the expected `EPERM` denial.
+
+### Known limitations
+
+- The recorded boundary PASS applies only to the tested alternative `codex-cli 0.146.0-alpha.3.1` executable. It does not validate the active PATH CLI `codex-cli 0.145.0`, whose boundary remained `NOT TESTED`.
+- Share-safe reports intentionally retain diagnostic version, installation, runtime, and security-status information. They reduce disclosure risk but are not anonymity guarantees and must be reviewed before public sharing.
+
 ## 0.1.0-alpha.10 – 2026-07-25
 
 - Keep Notepad and File Explorer GUI windows visible instead of launching them with `windowsHide: true`.
@@ -49,7 +92,7 @@
 - Uses the current `codex sandbox` permission-profile interface: `--permission-profile :workspace --cd <workspace>`.
 - Tests PowerShell, `cmd.exe`, and Node.js as matched inside/outside runtime pairs.
 - Reports a full pass only when every tested runtime can delete inside the workspace and is denied outside it.
-- Reports a partial pass when at least one runtime pair proves the boundary but another runtime remains inconclusive.
+- Reports incomplete or inconclusive runtime matrices without treating successful individual methods as a boundary verdict.
 
 ### Fixed
 

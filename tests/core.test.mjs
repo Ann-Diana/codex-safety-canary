@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { fileURLToPath } from 'node:url';
 import {
   ASSESSMENT_MODES,
   buildSandboxCommandArgs,
@@ -12,6 +13,8 @@ import {
   formatExecpolicyCoverage,
   launchDetachedProcess,
   detectWindowsSandboxFeature,
+  discoverCodexBundlePaths,
+  discoverStandalonePackages,
   inspectCodexBundle,
   normalizeCodexVersion,
   compareCodexVersions,
@@ -24,20 +27,212 @@ import {
   renderTextReport,
   safeRemoveRun,
   detectSandboxSetupFailure,
+  detectSandboxHelperResolutionFailure,
+  detectCommandRunnerProcessCreationFailure,
+  buildSandboxRuntimeEvidence,
+  deriveSandboxRuntimeObservation,
+  buildRuntimeDiagnostics,
+  parseCodexDoctorOutput,
+  parseStandaloneReleaseVersion,
   summarizeAssessment,
+  summarizeExecutableBundles,
   detectAccessDenied,
+  canonicalizeWindowsPath,
+  sameWindowsPath,
   classifySandboxProbe,
   buildNodeDeleteCommand,
+  buildPowerShellDeleteCommand,
   runHostDeletionPreflight,
+  runMethodHostCalibrations,
   buildSupportPayload,
+  SHARE_SAFE_SHARING_NOTICE,
+  formatShareSafeSharingNotice,
   renderSupportReport,
   writeReport,
 } from '../lib/core.mjs';
 
+function completeBoundaryProbes({ gapMethod = null } = {}) {
+  return ['powershell', 'cmd', 'node'].flatMap((method) => {
+    const insideId = `inside-workspace-${method}`;
+    const outsideId = `outside-workspace-${method}`;
+    const gap = method === gapMethod;
+    return [
+    {
+      method, location: 'inside', assessment: 'EXPECTED', observed: 'DELETED', targetId: insideId,
+      commandStarted: true, operationAttempted: true, hostCalibrationStatus: 'PASS', targetIdentityStatus: 'MATCHED', errorTargetMatched: false,
+      fileExistedBefore: true, fileExistsAfter: false, unrelatedFailureDetected: false,
+    },
+    {
+      method,
+      location: 'outside',
+      assessment: gap ? 'CRITICAL_GAP' : 'PASS',
+      observed: gap ? 'DELETED' : 'RETAINED',
+      targetId: outsideId,
+      commandStarted: true,
+      operationAttempted: true,
+      hostCalibrationStatus: 'PASS',
+      targetIdentityStatus: 'MATCHED',
+      errorTargetMatched: !gap,
+      fileExistedBefore: true,
+      fileExistsAfter: !gap,
+      unrelatedFailureDetected: false,
+    },
+  ];
+  });
+}
+
+function completedBoundarySandbox(overrides = {}) {
+  return {
+    status: 'COMPLETED',
+    codexSource: 'ACTIVE_CLI',
+    hostPreflight: { passed: true, filesChecked: 2 },
+    hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
+    smoke: { passed: true, commandExitCode: 0, setupFailure: false, stderr: '' },
+    probes: completeBoundaryProbes(),
+    cleanup: {
+      status: 'COMPLETED', attempted: true, completed: true, errorPresent: false,
+      message: 'Disposable run folder removed before final reports were written.',
+    },
+    ...overrides,
+  };
+}
+
+function failedCleanup(message = 'Could not remove disposable run folder.') {
+  return { status: 'FAILED', attempted: true, completed: false, errorPresent: true, message };
+}
+
+function pngCrc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function readPngChunks(file) {
+  const data = fs.readFileSync(file);
+  assert.deepEqual(data.subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const chunks = [];
+  let offset = 8;
+  while (offset < data.length) {
+    assert.ok(offset + 12 <= data.length, `truncated PNG chunk in ${file}`);
+    const length = data.readUInt32BE(offset);
+    const typeBytes = data.subarray(offset + 4, offset + 8);
+    const payload = data.subarray(offset + 8, offset + 8 + length);
+    const expectedCrc = data.readUInt32BE(offset + 8 + length);
+    assert.equal(pngCrc32(Buffer.concat([typeBytes, payload])), expectedCrc, `invalid PNG CRC in ${file}`);
+    const type = typeBytes.toString('ascii');
+    chunks.push({ type, payload });
+    offset += 12 + length;
+    if (type === 'IEND') break;
+  }
+  assert.equal(chunks.at(-1)?.type, 'IEND', `missing PNG IEND in ${file}`);
+  assert.equal(offset, data.length, `trailing PNG data in ${file}`);
+  return chunks;
+}
+
+function structuredProbeResult({
+  runtime,
+  targetId,
+  targetPath,
+  status,
+  succeeded,
+  errorClass = null,
+  errorCode = null,
+  errorCategory = null,
+  errorTarget = null,
+  errorReason = null,
+  errorHResult = null,
+  nativeWin32ErrorCode = null,
+  exceptionType = null,
+  errorMessage = null,
+  errorSyscall = runtime === 'node' ? 'rm' : null,
+  errorCommand = null,
+  errorActivity = null,
+  operation = runtime === 'node' ? 'fs.rmSync' : runtime === 'powershell' ? 'System.IO.File.Delete' : null,
+  operationTarget = targetPath,
+  targetState = null,
+  stderr = '',
+  operationOutput = null,
+}) {
+  const record = JSON.stringify({
+    codexSafetyCanaryProbe: 1,
+    runtime,
+    targetId,
+    targetPath,
+    commandStarted: true,
+    operationAttempted: true,
+    succeeded,
+    errorClass,
+    errorCode,
+    errorCategory,
+    errorTarget,
+    errorReason,
+    errorHResult,
+    nativeWin32ErrorCode,
+    exceptionType,
+    errorMessage,
+    errorSyscall,
+    errorCommand,
+    errorActivity,
+    operation,
+    operationTarget,
+    targetState,
+    exitCode: status,
+  });
+  const stdout = operationOutput == null
+    ? `${record}\n`
+    : `CODEX_CANARY_CMD_OUTPUT_BEGIN:${targetId}\n${operationOutput}\nCODEX_CANARY_CMD_OUTPUT_END:${targetId}\n${record}\n`;
+  return {
+    status,
+    stdout,
+    stderr,
+  };
+}
+
+function classifyStructuredProbe(method, location, options = {}) {
+  const targetPath = `C:\\Canary\\${method}-${location}.txt`;
+  const targetId = `${location}-workspace-${method}`;
+  const expected = location === 'inside' ? 'DELETED' : 'RETAINED';
+  const definition = { id: targetId, file: targetPath, expected, location, method };
+  if (location === 'inside' || options.gap === true) {
+    return {
+      method,
+      location,
+      observed: 'DELETED',
+      ...classifySandboxProbe({
+        before: true,
+        after: false,
+        definition,
+        result: structuredProbeResult({ runtime: method, targetId, targetPath, status: 0, succeeded: true, targetState: 'DELETED' }),
+        hostCalibration: { method, status: 'PASS', passed: true },
+      }),
+    };
+  }
+  const access = method === 'node'
+    ? { errorClass: 'Error', errorCode: 'EACCES', errorTarget: targetPath }
+    : method === 'powershell'
+      ? { exceptionType: 'System.UnauthorizedAccessException', errorClass: 'System.UnauthorizedAccessException', errorCategory: 'PermissionDenied', errorTarget: targetPath }
+      : { targetState: 'RETAINED', operationOutput: 'Access is denied.' };
+  return {
+    method,
+    location,
+    observed: 'RETAINED',
+    ...classifySandboxProbe({
+      before: true,
+      after: true,
+      definition,
+      result: structuredProbeResult({ runtime: method, targetId, targetPath: method === 'cmd' ? null : targetPath, status: 1, succeeded: false, ...access }),
+      hostCalibration: { method, status: 'PASS', passed: true },
+    }),
+  };
+}
+
 test('findDecision handles common execpolicy shapes', () => {
   assert.equal(findDecision({ decision: 'prompt' }), 'prompt');
   assert.equal(findDecision({ result: { strictest_decision: 'forbidden' } }), 'forbidden');
-  assert.equal(findDecision({ nested: [{ decision: 'allowed' }] }), 'allow');
+  assert.equal(findDecision({ nested: [{ decision: 'allowed' }] }), null);
   assert.equal(findDecision({ message: 'nothing useful' }), null);
 });
 
@@ -56,6 +251,42 @@ test('execpolicy parser accepts the current matchedRules plus decision schema', 
   });
   assert.equal(result.status, 'OK');
   assert.equal(result.decision, 'prompt');
+});
+
+test('execpolicy parser accepts only recognized aggregate decisions', () => {
+  for (const decision of ['allow', 'prompt', 'forbidden']) {
+    const result = parseExecpolicyOutput({ decision });
+    assert.equal(result.status, 'OK');
+    assert.equal(result.decision, decision);
+  }
+  assert.equal(parseExecpolicyOutput({ decision: 'unexpected' }).status, 'UNKNOWN_SCHEMA');
+  assert.equal(parseExecpolicyOutput({ decision: 'allow', strictestDecision: 'forbidden' }).status, 'UNKNOWN_SCHEMA');
+});
+
+test('execpolicy parser ignores arbitrary nested decisions and is order independent', () => {
+  const allowFirst = parseExecpolicyOutput({ metadata: { first: 'allow', later: 'forbidden' } });
+  const forbiddenFirst = parseExecpolicyOutput({ metadata: { first: 'forbidden', later: 'allow' } });
+  assert.equal(allowFirst.status, 'UNKNOWN_SCHEMA');
+  assert.equal(allowFirst.decision, null);
+  assert.equal(forbiddenFirst.status, 'UNKNOWN_SCHEMA');
+  assert.equal(forbiddenFirst.decision, null);
+});
+
+test('execpolicy matched-rule fallback computes the strictest known decision', () => {
+  const first = parseExecpolicyOutput({
+    matchedRules: [
+      { prefixRuleMatch: { decision: 'allow' } },
+      { prefixRuleMatch: { decision: 'forbidden' } },
+      { prefixRuleMatch: { decision: 'prompt' } },
+    ],
+  });
+  const reversed = parseExecpolicyOutput({ matchedRules: [...first.parsed.matchedRules].reverse() });
+  assert.equal(first.status, 'OK');
+  assert.equal(first.decision, 'forbidden');
+  assert.equal(reversed.status, 'OK');
+  assert.equal(reversed.decision, 'forbidden');
+  assert.equal(parseExecpolicyOutput({ decision: 'allow', matchedRules: [{ prefixRuleMatch: { decision: 'forbidden' } }] }).status, 'UNKNOWN_SCHEMA');
+  assert.equal(parseExecpolicyOutput({ matchedRules: [{ prefixRuleMatch: { decision: 'unknown' } }] }).status, 'UNKNOWN_SCHEMA');
 });
 
 test('path containment rejects siblings', () => {
@@ -174,8 +405,10 @@ test('sandbox setup failures are not mistaken for boundary passes', () => {
 });
 
 test('empty sandbox result is not a pass', () => {
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], { probes: [] });
-  assert.equal(summary.boundary, 'NOT TESTED');
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], { codexSource: 'ACTIVE_CLI', probes: [] });
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '0/3');
 });
 test('windows sandbox detection reports AVAILABLE from general sandbox help', () => {
   const result = detectWindowsSandboxFeature({
@@ -271,7 +504,20 @@ test('codex bundle inspection requires the sandbox helper and command runner', (
   fs.writeFileSync(path.join(temp, 'codex-windows-sandbox-setup.exe'), 'synthetic');
   result = inspectCodexBundle(codex);
   assert.equal(result.complete, true);
+  assert.equal(result.resourceLayout, 'COMPLETE');
+  assert.equal(result.probeEligible, true);
+  assert.equal(result.helperResolution, 'NOT_TESTED');
+  assert.equal(result.runtimeStartup, 'NOT_TESTED');
+  assert.equal(result.helperResolutionProven, false);
   assert.deepEqual(result.missing, []);
+  const summary = summarizeAssessment({ codexVersion: 'codex-cli 0.146.0', activeBundle: result, config: { warnings: [] } }, [], null, {
+    assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY,
+    execpolicyRun: false,
+  });
+  assert.equal(summary.activeCli.resourceLayout, 'COMPLETE');
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.activeCli.runtimeStartup, 'NOT_TESTED');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
   fs.rmSync(temp, { recursive: true, force: true });
 });
 
@@ -284,15 +530,125 @@ test('probe plan prefers the active complete CLI bundle', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
     activeCodexPath: 'C:\\active\\codex.exe',
-    activeBundle: { complete: true },
+    activeBundle: { complete: true, probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'CONFIRMED', runtimeStartup: 'NOT_TESTED' },
     sandboxFullAutoAvailable: true,
     sandboxHelperInPath: false,
     matchingCompleteBundles: [],
   });
   assert.equal(plan.ready, true);
   assert.equal(plan.requiresConfirmation, false);
+  assert.equal(plan.requiresSelection, false);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI']);
   assert.equal(plan.source, 'ACTIVE_CLI');
   assert.equal(plan.fullAutoAvailable, true);
+});
+
+test('probe plan exposes active and same-version alternative executables for explicit selection', () => {
+  const plan = selectCodexProbePlan({
+    sandboxWindowsState: 'AVAILABLE',
+    activeCodexPath: 'C:\\active\\codex.exe',
+    codexVersion: 'codex-cli 0.145.0',
+    activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
+    sandboxFullAutoAvailable: true,
+    matchingCompleteBundles: [{
+      executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
+      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
+    }],
+    newerCompleteBundles: [],
+  });
+  assert.equal(plan.ready, true);
+  assert.equal(plan.requiresSelection, true);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'MATCHING_COMPLETE_BUNDLE']);
+  assert.equal(plan.candidates[1].isAlternativeExecutable, true);
+  assert.match(plan.candidates[1].scopeNote, /does not validate the active PATH CLI/);
+});
+
+test('probe plan exposes active and newer alternative executables with a version warning state', () => {
+  const plan = selectCodexProbePlan({
+    sandboxWindowsState: 'AVAILABLE',
+    activeCodexPath: 'C:\\active\\codex.exe',
+    codexVersion: 'codex-cli 0.145.0',
+    activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
+    newerCompleteBundles: [{
+      executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0-alpha.3.1', probeEligible: true,
+      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
+    }],
+  });
+  assert.equal(plan.requiresSelection, true);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'NEWER_COMPLETE_BUNDLE']);
+  assert.equal(plan.candidates[1].versionMismatch, true);
+  assert.match(plan.candidates[1].scopeNote, /0\.146\.0-alpha\.3\.1/);
+});
+
+test('probe plan exposes all three candidate classes in recommended order', () => {
+  const plan = selectCodexProbePlan({
+    sandboxWindowsState: 'AVAILABLE',
+    activeCodexPath: 'C:\\active\\codex.exe',
+    codexVersion: 'codex-cli 0.145.0',
+    activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
+    matchingCompleteBundles: [{
+      executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
+      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+    }],
+    newerCompleteBundles: [{
+      executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0', probeEligible: true,
+      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+    }],
+  });
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), [
+    'ACTIVE_CLI', 'MATCHING_COMPLETE_BUNDLE', 'NEWER_COMPLETE_BUNDLE',
+  ]);
+});
+
+test('probe plan deduplicates an executable reached through a junction alias and its real path', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-probe-plan-alias-'));
+  const releaseDir = path.join(temp, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const releaseBin = path.join(releaseDir, 'bin');
+  const currentDir = path.join(temp, 'current');
+  fs.mkdirSync(releaseBin, { recursive: true });
+  fs.writeFileSync(path.join(releaseBin, 'codex.exe'), 'synthetic');
+  fs.symlinkSync(releaseDir, currentDir, process.platform === 'win32' ? 'junction' : 'dir');
+  const plan = selectCodexProbePlan({
+    sandboxWindowsState: 'AVAILABLE',
+    activeCodexPath: path.join(currentDir, 'bin', 'codex.exe'),
+    codexVersion: 'codex-cli 0.146.0',
+    activeBundle: { complete: false, probeEligible: true, resourceLayout: 'COMPLETE' },
+    matchingCompleteBundles: [{
+      executablePath: path.join(releaseBin, 'codex.exe'), version: 'codex-cli 0.146.0', probeEligible: true,
+      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+    }],
+  });
+  assert.equal(plan.candidates.length, 1);
+  assert.equal(plan.candidates[0].source, 'ACTIVE_CLI');
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
+test('probe plan offers an active probe-eligible standalone executable when sandbox state is AVAILABLE', () => {
+  const activeBundle = {
+    complete: false,
+    probeEligible: true,
+    installType: 'standalone',
+    resourceLayout: 'COMPLETE',
+    helperResolution: 'NOT_TESTED',
+    runtimeStartup: 'NOT_TESTED',
+    standaloneResourcesFound: true,
+    standaloneRequiredResourcesPresent: true,
+    standalonePackage: { releaseVersion: '0.146.0' },
+  };
+  const plan = selectCodexProbePlan({
+    sandboxWindowsState: 'AVAILABLE',
+    activeCodexPath: 'C:\\standalone\\current\\bin\\codex.exe',
+    codexVersion: 'codex-cli 0.146.0',
+    activeBundle,
+    sandboxFullAutoAvailable: false,
+    sandboxHelperInPath: false,
+  });
+  assert.equal(plan.ready, true);
+  assert.equal(plan.source, 'ACTIVE_CLI');
+  assert.equal(plan.requiresConfirmation, false);
+  assert.equal(plan.testedBundleMetadata.resourceLayout, 'COMPLETE');
+  assert.equal(plan.testedBundleMetadata.helperResolution, 'NOT_TESTED');
+  assert.equal(plan.testedBundleMetadata.runtimeStartup, 'NOT_TESTED');
 });
 
 test('probe plan offers a same-version complete bundle when the active bundle is incomplete', () => {
@@ -323,9 +679,11 @@ test('probe plan fails closed when no complete matching bundle exists', () => {
 });
 
 test('setup failure summary keeps workspace deletion and boundary as untested', () => {
+  const error = 'codex-windows-sandbox-setup.exe program not found';
   const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
     status: 'SETUP_FAILED',
-    error: 'codex-windows-sandbox-setup.exe program not found',
+    runtimeEvidence: buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' }),
+    error,
     probes: [],
   });
   assert.equal(summary.sandboxRuntime, 'FAILED – HELPER NOT RESOLVABLE');
@@ -383,14 +741,10 @@ test('probe plan rejects a newer complete bundle whose sandbox command is not te
 });
 
 test('alternative bundle pass is not reported as validation of the active CLI', () => {
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
-    status: 'COMPLETED',
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    codexSource: 'NEWER_COMPLETE_BUNDLE',
     versionMismatch: true,
-    probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-    ],
-  });
+  }));
   assert.equal(summary.overall, 'ALTERNATIVE BUNDLE BOUNDARY PASSED');
   assert.equal(summary.boundary, 'PASS');
 });
@@ -422,70 +776,547 @@ test('access-denial detection recognizes Windows denial messages', () => {
   assert.equal(detectAccessDenied({ stderr: 'SyntaxError: missing ) after argument list' }), false);
 });
 
-test('retained outside file is PASS only with denial evidence', () => {
-  const definition = { expected: 'RETAINED', location: 'outside' };
-  assert.deepEqual(
-    classifySandboxProbe({ before: true, after: true, result: { status: 1, stderr: 'Zugriff verweigert' }, definition }),
-    { assessment: 'PASS', denialEvidence: true },
-  );
-  assert.deepEqual(
-    classifySandboxProbe({ before: true, after: true, result: { status: 1, stderr: 'SyntaxError' }, definition }),
-    { assessment: 'TEST_ERROR', denialEvidence: false },
-  );
+test('Windows path canonicalization matches namespace, UNC, slash, and case variants', () => {
+  assert.equal(canonicalizeWindowsPath('\\\\?\\C:\\Canary\\Outside.txt'), 'c:\\canary\\outside.txt');
+  assert.equal(sameWindowsPath('C:\\Canary\\Outside.txt', '\\\\?\\c:\\canary\\outside.txt'), true);
+  assert.equal(sameWindowsPath('\\\\server\\share\\Folder\\File.txt', '\\\\?\\UNC\\SERVER\\SHARE\\folder\\file.txt'), true);
+  assert.equal(sameWindowsPath('C:/Canary/Outside.txt', 'c:\\canary\\outside.txt'), true);
+  assert.equal(sameWindowsPath('C:\\Canary\\Outside.txt', 'C:\\Canary\\Other.txt'), false);
+});
+
+test('Node EPERM with a namespace error target matches the controlled outside file', () => {
+  const targetPath = 'C:\\Canary\\outside-node.txt';
+  const definition = { id: 'outside-workspace-node', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'node', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'node', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      errorClass: 'Error', errorCode: 'EPERM', errorTarget: '\\\\?\\C:\\Canary\\outside-node.txt', errorSyscall: 'rm',
+    }),
+  });
+  assert.equal(result.targetIdentityStatus, 'MATCHED');
+  assert.equal(result.errorTargetMatched, true);
+  assert.equal(result.assessment, 'PASS');
+});
+
+test('retained outside file passes only with structured target-related access evidence', () => {
+  const targetPath = 'C:\\Canary\\outside-node.txt';
+  const definition = { id: 'outside-workspace-node', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const targeted = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'node', status: 'PASS', passed: true },
+    result: structuredProbeResult({ runtime: 'node', targetId: definition.id, targetPath, status: 1, succeeded: false, errorClass: 'Error', errorCode: 'EACCES', errorTarget: targetPath }),
+  });
+  assert.equal(targeted.assessment, 'PASS');
+  assert.equal(targeted.errorTargetMatched, true);
+  assert.equal(targeted.operationAttempted, true);
+
+  const unrelated = classifySandboxProbe({ before: true, after: true, result: { status: 1, stderr: 'SyntaxError: invalid command\nAccess to network is denied' }, definition, hostCalibration: { method: 'node', status: 'PASS', passed: true } });
+  assert.equal(unrelated.assessment, 'TEST_ERROR');
+  assert.equal(unrelated.denialEvidence, false);
 });
 
 test('inside workspace denial fails the workspace-write control', () => {
-  const definition = { expected: 'DELETED', location: 'inside' };
-  assert.deepEqual(
-    classifySandboxProbe({ before: true, after: true, result: { status: 1, stderr: 'Access is denied.' }, definition }),
-    { assessment: 'UNEXPECTED', denialEvidence: true },
-  );
+  const targetPath = 'C:\\Canary\\inside-powershell.txt';
+  const definition = { id: 'inside-workspace-powershell', file: targetPath, expected: 'DELETED', location: 'inside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({ runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false, errorClass: 'System.UnauthorizedAccessException', errorCategory: 'PermissionDenied', errorTarget: targetPath }),
+  });
+  assert.equal(result.assessment, 'UNEXPECTED');
+  assert.equal(result.errorTargetMatched, true);
+});
+
+test('command-not-found plus generic access denied is inconclusive', () => {
+  const definition = { id: 'outside-workspace-cmd', file: 'C:\\Canary\\outside-cmd.txt', expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({ before: true, after: true, definition, result: { status: 1, stderr: 'command not found\nAccess is denied.' }, hostCalibration: { method: 'cmd', status: 'PASS', passed: true } });
+  assert.equal(result.assessment, 'TEST_ERROR');
+  assert.equal(result.errorTargetMatched, false);
+  assert.equal(result.unrelatedFailureDetected, true);
+});
+
+test('PowerShell access failure requires structured operation and target evidence', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const targeted = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({ runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false, errorClass: 'System.UnauthorizedAccessException', errorCategory: 'PermissionDenied', errorTarget: targetPath }),
+  });
+  const wrongTarget = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({ runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false, errorClass: 'System.UnauthorizedAccessException', errorCategory: 'PermissionDenied', errorTarget: 'C:\\Canary\\other.txt' }),
+  });
+  assert.equal(targeted.assessment, 'PASS');
+  assert.equal(wrongTarget.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell cannot use the intended target as artificial ErrorRecord target evidence', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      errorClass: 'System.ArgumentException', errorCode: 'RemoveFileSystemItemArgumentError', errorCategory: 'InvalidArgument',
+      errorTarget: null, operation: null, operationTarget: null, errorCommand: null,
+    }),
+  });
+  assert.equal(result.targetIdentityStatus, 'NOT MATCHED');
+  assert.equal(result.errorTargetMatched, false);
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell ArgumentException with InvalidArgument and a matching target fails closed', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.ArgumentException',
+      errorClass: 'System.ArgumentException',
+      errorCode: 'RemoveFileSystemItemArgumentError,Microsoft.PowerShell.Commands.RemoveItemCommand',
+      errorCategory: 'InvalidArgument', errorReason: 'ArgumentException', errorTarget: targetPath,
+      operation: 'System.IO.File.Delete', operationTarget: targetPath,
+    }),
+  });
+  assert.equal(result.targetIdentityStatus, 'MATCHED');
+  assert.equal(result.controlledOperationMatched, true);
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell RemoveFileSystemItemArgumentError with access-denied text fails closed', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.ArgumentException', errorClass: 'System.ArgumentException',
+      errorCode: 'RemoveFileSystemItemArgumentError', errorCategory: 'InvalidArgument',
+      errorTarget: targetPath, errorMessage: 'Access is denied.', stderr: 'Zugriff verweigert',
+    }),
+  });
+  assert.equal(result.assessment, 'TEST_ERROR');
+  assert.equal(result.denialEvidence, false);
+});
+
+test('PowerShell ArgumentException without an actual error target fails closed', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.ArgumentException', errorClass: 'System.ArgumentException',
+      errorCategory: 'InvalidArgument', errorTarget: null,
+    }),
+  });
+  assert.equal(result.targetIdentityStatus, 'MATCHED');
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell UnauthorizedAccessException with a matching controlled target passes', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.UnauthorizedAccessException', errorClass: 'System.UnauthorizedAccessException', errorTarget: targetPath,
+    }),
+  });
+  assert.equal(result.nativeWin32ErrorCode, null);
+  assert.equal(result.assessment, 'PASS');
+});
+
+test('PowerShell HResult with native access-denied code 5 and a matching target passes', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.IO.IOException', errorClass: 'System.IO.IOException',
+      errorHResult: -2147024891, errorTarget: targetPath,
+    }),
+  });
+  assert.equal(result.nativeWin32ErrorCode, 5);
+  assert.equal(result.assessment, 'PASS');
+});
+
+test('PowerShell PermissionDenied with a wrong target fails closed', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.Management.Automation.RuntimeException', errorCategory: 'PermissionDenied',
+      errorTarget: 'C:\\Canary\\other.txt',
+    }),
+  });
+  assert.equal(result.targetIdentityStatus, 'NOT MATCHED');
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell PermissionDenied with an independently matching target passes', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.Management.Automation.RuntimeException', errorCategory: 'PermissionDenied', errorTarget: targetPath,
+    }),
+  });
+  assert.equal(result.errorTargetMatched, true);
+  assert.equal(result.assessment, 'PASS');
+});
+
+test('PowerShell PermissionDenied cannot pass after a failed method calibration', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'FAIL', passed: false },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      exceptionType: 'System.Management.Automation.RuntimeException', errorCategory: 'PermissionDenied', errorTarget: targetPath,
+    }),
+  });
+  assert.equal(result.denialEvidenceMatched, true);
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('PowerShell message-only access denial fails closed', () => {
+  const targetPath = 'C:\\Canary\\outside-powershell.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      errorMessage: 'Zugriff verweigert', stderr: 'Zugriff verweigert',
+    }),
+  });
+  assert.equal(result.assessment, 'TEST_ERROR');
+  assert.equal(result.denialEvidence, false);
+});
+
+test('cmd generic denial without the controlled operation record fails closed', () => {
+  const definition = { id: 'outside-workspace-cmd', file: 'C:\\Canary\\outside-cmd.txt', expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({ before: true, after: true, definition, result: { status: 1, stderr: 'Access is denied.' }, hostCalibration: { method: 'cmd', status: 'PASS', passed: true } });
+  assert.equal(result.assessment, 'TEST_ERROR');
+  assert.equal(result.commandStarted, false);
+  assert.equal(result.errorTargetMatched, false);
+});
+
+test('cmd structured record cannot borrow denial text from outside its operation-output markers', () => {
+  const targetPath = 'C:\\Canary\\outside-cmd.txt';
+  const definition = { id: 'outside-workspace-cmd', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'cmd', status: 'PASS', passed: true },
+    result: structuredProbeResult({ runtime: 'cmd', targetId: definition.id, targetPath: null, status: 1, succeeded: false, targetState: 'RETAINED', stderr: 'Access is denied.' }),
+  });
+  assert.equal(result.assessment, 'TEST_ERROR');
+  assert.equal(result.commandStarted, true);
+  assert.equal(result.errorTargetMatched, false);
+});
+
+test('failed method calibration prevents an otherwise valid outside PASS', () => {
+  const targetPath = 'C:\\Canary\\outside-node.txt';
+  const definition = { id: 'outside-workspace-node', file: targetPath, expected: 'RETAINED', location: 'outside' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'node', status: 'FAIL', passed: false },
+    result: structuredProbeResult({
+      runtime: 'node', targetId: definition.id, targetPath, status: 1, succeeded: false,
+      errorClass: 'Error', errorCode: 'EPERM', errorTarget: targetPath, errorSyscall: 'rm',
+    }),
+  });
+  assert.equal(result.denialEvidenceMatched, true);
+  assert.equal(result.hostCalibrationPassed, false);
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('full structured three-runtime matrix still produces a boundary pass', () => {
+  const probes = ['powershell', 'cmd', 'node'].flatMap((method) => [
+    classifyStructuredProbe(method, 'inside'),
+    classifyStructuredProbe(method, 'outside'),
+  ]);
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({ probes }));
+  assert.equal(summary.overall, 'BOUNDARY TEST PASSED');
+  assert.equal(summary.boundary, 'PASS');
+  assert.equal(summary.methodCoverage, '3/3');
+  assert.deepEqual(summary.nextSteps, []);
 });
 
 test('boundary cannot pass when every runtime control fails', () => {
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
-    status: 'COMPLETED',
-    versionMismatch: true,
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    codexSource: 'MATCHING_COMPLETE_BUNDLE',
+    versionMismatch: false,
     probes: [
       { method: 'powershell', location: 'inside', assessment: 'UNEXPECTED', observed: 'RETAINED' },
       { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
     ],
-  });
+  }));
   assert.equal(summary.overall, 'ALTERNATIVE BUNDLE TEST ERROR / INCOMPLETE');
   assert.equal(summary.boundary, 'TEST ERROR');
   assert.equal(summary.workspaceDeletion, 'CONTROL FAILED');
 });
 
 test('boundary passes only when every tested runtime pair passes', () => {
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
-    status: 'COMPLETED',
-    versionMismatch: false,
-    probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-      { method: 'cmd', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'cmd', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-    ],
-  });
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox());
   assert.equal(summary.overall, 'BOUNDARY TEST PASSED');
   assert.equal(summary.boundary, 'PASS');
-  assert.equal(summary.methodCoverage, '2/2');
+  assert.equal(summary.methodCoverage, '3/3');
 });
 
-test('one valid runtime pair produces only a partial pass when another runtime control fails', () => {
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
-    status: 'COMPLETED',
-    versionMismatch: true,
+test('one valid runtime pair cannot produce a pass when another runtime control fails', () => {
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    codexSource: 'MATCHING_COMPLETE_BUNDLE',
+    versionMismatch: false,
     probes: [
       { method: 'powershell', location: 'inside', assessment: 'UNEXPECTED', observed: 'RETAINED' },
       { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
       { method: 'cmd', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
       { method: 'cmd', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
     ],
+  }));
+  assert.equal(summary.overall, 'ALTERNATIVE BUNDLE TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '1/3');
+});
+
+test('incomplete sandbox execution cannot produce a boundary pass', () => {
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    status: 'ERROR',
+    probes: completeBoundaryProbes().slice(0, 2),
+  }));
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '1/3');
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_BUNDLE_BOUNDARY_PASS'), false);
+});
+
+test('sandbox error evidence has priority over complete probe results', () => {
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    error: 'Synthetic runtime failure after probe collection.',
+  }));
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '3/3');
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_BUNDLE_BOUNDARY_PASS'), false);
+});
+
+test('missing Node runtime pair is a test error with fixed three-pair coverage', () => {
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    probes: completeBoundaryProbes().filter((probe) => probe.method !== 'node'),
+  }));
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '2/3');
+});
+
+test('failed host preflight or smoke prevents a boundary pass', () => {
+  const failedPreflight = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    hostPreflight: { passed: false, filesChecked: 1, error: 'preflight failed' },
+  }));
+  const failedSmoke = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    smoke: { passed: false, commandExitCode: 1, setupFailure: true, stderr: 'smoke failed' },
+  }));
+  for (const summary of [failedPreflight, failedSmoke]) {
+    assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+    assert.equal(summary.boundary, 'TEST ERROR');
+    assert.equal(summary.methodCoverage, '3/3');
+  }
+});
+
+test('cleanup status is required and fail-closed for every non-completed state', () => {
+  const completed = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox());
+  assert.equal(completed.overall, 'BOUNDARY TEST PASSED');
+  assert.equal(completed.boundary, 'PASS');
+  assert.equal(completed.cleanup.status, 'COMPLETED');
+
+  const cases = [
+    ['FAILED', failedCleanup()],
+    ['localized FAILED', failedCleanup('Der temporäre Laufordner konnte nicht entfernt werden.')],
+    ['NOT_RUN', { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null }],
+    ['unknown status', { status: 'REMOVED', attempted: true, completed: true, errorPresent: false, message: null }],
+    ['contradictory COMPLETED', { status: 'COMPLETED', attempted: true, completed: false, errorPresent: false, message: null }],
+  ];
+  for (const [label, cleanup] of cases) {
+    const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({ cleanup }));
+    assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE', label);
+    assert.equal(summary.boundary, 'TEST ERROR', label);
+    assert.notEqual(summary.cleanup.status, 'COMPLETED', label);
+  }
+
+  const missingCleanup = completedBoundarySandbox();
+  delete missingCleanup.cleanup;
+  const missing = summarizeAssessment({ config: { warnings: [] } }, [], missingCleanup);
+  assert.equal(missing.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(missing.boundary, 'TEST ERROR');
+  assert.equal(missing.cleanup.status, 'NOT_RUN');
+  assert.equal(missing.cleanup.valid, false);
+
+  const legacyText = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    cleanup: 'Disposable run folder removed before final reports were written.',
+  }));
+  assert.equal(legacyText.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(legacyText.boundary, 'TEST ERROR');
+
+  const inconsistentSmokeStatus = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({ status: 'SMOKE_COMPLETED' }));
+  assert.equal(inconsistentSmokeStatus.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(inconsistentSmokeStatus.boundary, 'TEST ERROR');
+});
+
+test('cleanup failure prevents a boundary pass independently of message wording', () => {
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
+    cleanup: failedCleanup('Could not remove disposable run folder.'),
+  }));
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '3/3');
+  assert.equal(summary.cleanup.status, 'FAILED');
+});
+
+test('confirmed boundary gap remains primary when a sibling probe is a test error', () => {
+  const probes = completeBoundaryProbes({ gapMethod: 'powershell' }).map((probe) => (
+    probe.method === 'cmd' && probe.location === 'outside'
+      ? { ...probe, assessment: 'TEST_ERROR', observed: 'RETAINED', fileExistsAfter: true, errorTargetMatched: false }
+      : probe
+  ));
+  const summary = summarizeAssessment(
+    { config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' },
+    [],
+    completedBoundarySandbox({ probes })
+  );
+
+  assert.equal(summary.boundary, 'GAP');
+  assert.match(summary.overall, /GAP.*ADDITIONAL PROBE ERRORS/);
+  assert.equal(summary.additionalProbeErrors, true);
+  assert.deepEqual(summary.boundaryGapMethods, ['powershell']);
+  assert.equal(summary.recommendations[0].code, 'BOUNDARY_GAP');
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED'), false);
+  assert.match(summary.interpretation.join('\n'), /confirmed sandbox boundary gap/i);
+  assert.match(summary.interpretation.join('\n'), /additional probe errors.*do not weaken/i);
+});
+
+test('confirmed boundary gap remains primary with missing method coverage', () => {
+  const probes = completeBoundaryProbes({ gapMethod: 'powershell' })
+    .filter((probe) => probe.method !== 'node');
+  const summary = summarizeAssessment(
+    { config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' },
+    [],
+    completedBoundarySandbox({ probes })
+  );
+
+  assert.equal(summary.boundary, 'GAP');
+  assert.match(summary.overall, /GAP.*ADDITIONAL PROBE ERRORS/);
+  assert.equal(summary.additionalProbeErrors, true);
+  assert.equal(summary.methodCoverage, '1/3');
+});
+
+test('confirmed boundary gap remains primary with cleanup failure', () => {
+  const summary = summarizeAssessment(
+    { config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' },
+    [],
+    completedBoundarySandbox({
+      probes: completeBoundaryProbes({ gapMethod: 'powershell' }),
+      cleanup: failedCleanup('Der temporäre Laufordner konnte nicht entfernt werden.'),
+    })
+  );
+
+  assert.equal(summary.boundary, 'GAP');
+  assert.match(summary.overall, /GAP.*ADDITIONAL PROBE ERRORS/);
+  assert.equal(summary.additionalProbeErrors, true);
+  assert.equal(summary.cleanup.status, 'FAILED');
+  assert.equal(summary.recommendations[0].code, 'BOUNDARY_GAP');
+});
+
+test('multiple confirmed gaps and sibling errors retain one primary gap recommendation', () => {
+  const probes = completeBoundaryProbes({ gapMethod: 'powershell' }).map((probe) => {
+    if (probe.method === 'cmd' && probe.location === 'outside') {
+      return { ...probe, assessment: 'CRITICAL_GAP', observed: 'DELETED', fileExistsAfter: false, errorTargetMatched: false };
+    }
+    if (probe.method === 'node' && probe.location === 'outside') {
+      return { ...probe, assessment: 'TEST_ERROR', observed: 'RETAINED', fileExistsAfter: true, errorTargetMatched: false };
+    }
+    return probe;
   });
-  assert.equal(summary.overall, 'ALTERNATIVE BUNDLE PARTIAL PASS');
-  assert.equal(summary.boundary, 'PARTIAL PASS');
-  assert.equal(summary.methodCoverage, '1/2');
+  const summary = summarizeAssessment(
+    { config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' },
+    [],
+    completedBoundarySandbox({ probes, error: 'Synthetic additional probe errors.' })
+  );
+
+  assert.equal(summary.boundary, 'GAP');
+  assert.deepEqual(summary.boundaryGapMethods, ['powershell', 'cmd']);
+  assert.equal(summary.recommendations.filter((item) => item.code === 'BOUNDARY_GAP').length, 1);
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED'), false);
+});
+
+test('execpolicy unknown schema remains separate from a confirmed boundary gap', () => {
+  const summary = summarizeAssessment(
+    { config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' },
+    [{ label: 'synthetic unknown schema', command: ['synthetic'], status: 'UNKNOWN_SCHEMA', decision: null }],
+    completedBoundarySandbox({ probes: completeBoundaryProbes({ gapMethod: 'powershell' }) }),
+    { execpolicyRun: true }
+  );
+
+  assert.equal(summary.boundary, 'GAP');
+  assert.equal(summary.additionalProbeErrors, false);
+  assert.deepEqual(summary.execpolicyCoverage, { status: 'UNKNOWN_SCHEMA', matched: null, total: 1 });
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP'), true);
 });
 
 
@@ -509,28 +1340,112 @@ test('host deletion preflight proves normal user deletion works in both syntheti
   fs.rmSync(temp, { recursive: true, force: true });
 });
 
+test('method host calibration proves PowerShell, cmd.exe, and Node.js runners independently', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-method-calibration-'));
+  const layout = {
+    workspace: fs.mkdirSync(path.join(temp, 'workspace'), { recursive: true }),
+    control: fs.mkdirSync(path.join(temp, 'control'), { recursive: true }),
+  };
+  const methods = ['powershell', 'cmd', 'node'].map((method) => ({
+    method,
+    label: method,
+    command: (file, targetId) => [method, file, targetId],
+  }));
+  const calibrations = runMethodHostCalibrations(layout, 'marker', methods, {
+    runCommand: (command, cwd, context) => {
+      assert.equal(cwd, layout.workspace);
+      fs.rmSync(context.file);
+      return structuredProbeResult({
+        runtime: context.method.method,
+        targetId: context.definition.id,
+        targetPath: context.file,
+        status: 0,
+        succeeded: true,
+        targetState: 'DELETED',
+      });
+    },
+  });
+  assert.deepEqual(calibrations.map((item) => [item.method, item.status]), [
+    ['powershell', 'PASS'], ['cmd', 'PASS'], ['node', 'PASS'],
+  ]);
+  assert.equal(calibrations.every((item) => item.commandStarted && item.operationAttempted && !item.fileExistsAfter), true);
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
+test('PowerShell .NET host calibration deletes its synthetic file outside the sandbox', (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('PowerShell host calibration is Windows-specific.');
+    return;
+  }
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-powershell-dotnet-calibration-'));
+  const layout = {
+    workspace: fs.mkdirSync(path.join(temp, 'workspace'), { recursive: true }),
+    control: fs.mkdirSync(path.join(temp, 'control'), { recursive: true }),
+  };
+  const calibrations = runMethodHostCalibrations(layout, 'marker', [{
+    method: 'powershell',
+    label: 'PowerShell .NET',
+    command: (file, targetId) => buildPowerShellDeleteCommand(file, targetId),
+  }]);
+  assert.equal(calibrations[0].status, 'PASS');
+  assert.equal(calibrations[0].operation, 'System.IO.File.Delete');
+  assert.equal(calibrations[0].targetIdentityStatus, 'MATCHED');
+  assert.equal(calibrations[0].fileExistsAfter, false);
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
+test('ambiguous PowerShell error keeps a complete cmd.exe and Node.js run at TEST ERROR', () => {
+  const targetPath = 'C:\\Canary\\powershell-outside.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside', method: 'powershell' };
+  const ambiguousPowerShell = {
+    method: 'powershell',
+    location: 'outside',
+    observed: 'RETAINED',
+    ...classifySandboxProbe({
+      before: true,
+      after: true,
+      definition,
+      hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+      result: structuredProbeResult({
+        runtime: 'powershell', targetId: definition.id, targetPath, status: 1, succeeded: false,
+        exceptionType: 'System.ArgumentException', errorClass: 'System.ArgumentException',
+        errorCategory: 'InvalidArgument', errorTarget: targetPath,
+      }),
+    }),
+  };
+  const probes = [
+    classifyStructuredProbe('powershell', 'inside'),
+    ambiguousPowerShell,
+    classifyStructuredProbe('cmd', 'inside'),
+    classifyStructuredProbe('cmd', 'outside'),
+    classifyStructuredProbe('node', 'inside'),
+    classifyStructuredProbe('node', 'outside'),
+  ];
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({ probes }));
+  assert.equal(ambiguousPowerShell.assessment, 'TEST_ERROR');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.methodCoverage, '2/3');
+});
+
 
 test('summary separates the incomplete active CLI from a passing alternative bundle', () => {
   const summary = summarizeAssessment({
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: false },
     config: { warnings: [] },
-  }, [], {
-    status: 'COMPLETED',
+  }, [], completedBoundarySandbox({
     codexSource: 'NEWER_COMPLETE_BUNDLE',
     testedCodexVersion: 'codex-cli 0.146.0-alpha.3',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
-    probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-    ],
-  });
+  }));
   assert.equal(summary.activeCli.bundleStatus, 'INCOMPLETE');
   assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
   assert.equal(summary.testedBundle.boundaryStatus, 'PASS');
   assert.match(summary.interpretation.join(' '), /does not validate the active PATH CLI/i);
-  assert.match(summary.nextSteps.join(' '), /official installer/i);
+  assert.match(summary.nextSteps.join(' '), /selected alternative executable passed.*active PATH CLI.*separately/i);
+  assert.doesNotMatch(summary.nextSteps.join(' '), /test the selected alternative|Windows sandbox state is AVAILABLE/i);
 });
 
 test('share-safe support payload omits executable and credential paths', () => {
@@ -565,6 +1480,132 @@ test('share-safe support payload omits executable and credential paths', () => {
   assert.match(renderSupportReport(payload), /additional rule coverage only/i);
 });
 
+test('share-safe reports disclose removed and retained categories plus manual review', () => {
+  const report = {
+    generatedAt: '2026-01-01T00:00:00Z',
+    tool: { name: 'Canary', version: '0.1.0-alpha.11' },
+    summary: {
+      overall: 'NOT TESTED',
+      activeCli: {
+        bundleStatus: 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION NOT TESTED',
+        resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', boundaryStatus: 'NOT TESTED',
+      },
+      testedBundle: null,
+      sandboxRuntime: 'NOT TESTED',
+      execpolicyCoverage: { status: 'NOT_RUN', matched: null, total: null },
+      interpretation: [], nextSteps: [], recommendations: [], riskWarnings: [],
+    },
+    inventory: {
+      platform: 'win32', release: '10.0.synthetic', nodeVersion: 'v22.synthetic', nodeRuntimeSource: 'bundled', nodeInPath: false, npmInPath: false,
+      elevated: false, codexInstalled: true, codexVersion: 'codex-cli 0.146.0',
+      activeBundle: {
+        complete: false, installType: 'standalone', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED',
+        standaloneResourcesFound: true, standaloneRequiredResourcesPresent: true, missing: [],
+      },
+      standalonePackages: [], matchingCompleteBundles: [], newerCompleteBundles: [], ruleFiles: [], sandboxWindowsState: 'AVAILABLE',
+      doctor: { status: 'COMPLETED', ok: true, overallStatus: 'OK', installationStatus: 'READY', runtimeStatus: 'NOT_TESTED', warningCount: 0 },
+      config: { sandboxMode: 'workspace-write', approvalPolicy: 'on-request', defaultPermissions: null, windowsSandbox: true, networkAccess: false, warnings: [] },
+    },
+    execpolicy: [],
+    sandbox: null,
+  };
+  const payload = buildSupportPayload(report, {
+    USERNAME: 'Alice',
+    USERPROFILE: 'C:\\Users\\Alice',
+    CODEX_HOME: 'C:\\Users\\Alice\\.codex',
+  });
+  const supportText = renderSupportReport(payload);
+  assert.deepEqual(payload.sharingNotice, SHARE_SAFE_SHARING_NOTICE);
+  assert.equal(formatShareSafeSharingNotice(payload.sharingNotice), 'This support report removes local usernames, absolute local paths, credential paths, and raw configuration contents. It retains diagnostic version information, installation information, runtime information, and security-status information. Review it before public sharing.');
+  assert.match(supportText, /removes local usernames, absolute local paths, credential paths, and raw configuration contents/i);
+  assert.match(supportText, /retains diagnostic version information, installation information, runtime information, and security-status information/i);
+  assert.match(supportText, /Review it before public sharing/i);
+  assert.equal(payload.environment.windowsRelease, '10.0.synthetic');
+  assert.equal(payload.environment.nodeVersion, 'v22.synthetic');
+  assert.equal(payload.environment.activeCodexVersion, 'codex-cli 0.146.0');
+  assert.equal(payload.environment.activeInstallType, 'standalone');
+  assert.equal(payload.environment.activeRuntimeStartup, 'NOT_TESTED');
+  assert.equal(payload.environment.doctor.overallStatus, 'OK');
+  assert.equal(payload.environment.selectedConfig.sandboxMode, 'workspace-write');
+  const serializedNotice = JSON.stringify(payload.sharingNotice);
+  assert.doesNotMatch(serializedNotice, /Alice|config\.toml|[A-Za-z]:|\\\\/i);
+  assert.equal(serializedNotice.includes('\\'), false);
+});
+
+test('public documentation avoids absolute share-safe guarantees', () => {
+  const documents = ['../README.md', '../SECURITY.md', '../FAQ.md'].map((file) => fs.readFileSync(new URL(file, import.meta.url), 'utf8'));
+  for (const document of documents) {
+    assert.doesNotMatch(document, /no environment-specific information|contains no environment information|environment-free report/i);
+    assert.match(document, /diagnostic version.*installation.*runtime.*security-status/is);
+    assert.match(document, /review.*public|public.*review/is);
+  }
+});
+
+test('README references all nine authoritative screenshots exactly once with result-oriented alt text', () => {
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const screenshots = [
+    ['01-main-menu.png', 'Codex Safety Canary main menu with guided assessment, configuration review, execpolicy coverage and disposable Windows sandbox test options'],
+    ['02-sandbox-only-declined.png', 'Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED'],
+    ['03-sandbox-only-report-dialog.png', 'Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED'],
+    ['04-guided-live-probes-declined.png', 'Guided assessment completed with live probes declined, reporting PARTIAL / LIVE PROBES DECLINED, sandbox boundary NOT TESTED and runtime pairs NOT TESTED'],
+    ['05-execpolicy-coverage-test.png', 'Execpolicy coverage results for PowerShell Remove-Item, the PowerShell 7 wrapper, cmd.exe del, Node.js fs.rmSync, Git clean and Git reset, reported separately from the sandbox boundary'],
+    ['06-share-safe-support-report.png', 'Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review'],
+    ['07-share-safe-badge.png', 'Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing'],
+    ['08-executable-selection.png', 'Selection between the active PATH CLI and a separate newer Codex executable, with the sandbox result explicitly limited to the selected executable'],
+    ['09-alternative-bundle-boundary-pass.png', 'Separate Codex executable passing PowerShell, cmd.exe and Node.js sandbox boundary probes with complete three-of-three runtime coverage while the active PATH CLI remains NOT TESTED'],
+  ];
+  assert.equal(readme.split('docs/screenshots/').length - 1, screenshots.length);
+  for (const [name, alt] of screenshots) {
+    const relativePath = `docs/screenshots/${name}`;
+    assert.equal(readme.split(relativePath).length - 1, 1, relativePath);
+    assert.equal(readme.includes(`src="${relativePath}" alt="${alt}"`), true, name);
+    assert.equal(fs.existsSync(new URL(`../${relativePath}`, import.meta.url)), true, name);
+    const normalizedAlt = alt.toLowerCase();
+    for (const forbidden of ['no environment-specific information', 'anonymous', 'environment-free']) {
+      assert.equal(normalizedAlt.includes(forbidden), false, `${name}: ${forbidden}`);
+    }
+  }
+  assert.equal(readme.includes('alpha11-screenshot-overview.png'), false);
+  assert.equal(readme.includes('![]('), false);
+  const orderedPositions = screenshots.map(([name]) => readme.indexOf(`docs/screenshots/${name}`));
+  assert.deepEqual([...orderedPositions].sort((left, right) => left - right), orderedPositions);
+  assert.equal(screenshots[1][1].includes('NOT TESTED'), true);
+  assert.equal(screenshots[2][1].includes('NOT TESTED'), true);
+  assert.equal(screenshots[3][1].includes('PARTIAL'), true);
+  assert.equal(screenshots[3][1].includes('NOT TESTED'), true);
+  for (const commandForm of ['PowerShell Remove-Item', 'PowerShell 7 wrapper', 'cmd.exe del', 'Node.js fs.rmSync', 'Git clean', 'Git reset']) {
+    assert.equal(screenshots[4][1].includes(commandForm), true, commandForm);
+  }
+  assert.equal(screenshots[5][1].includes('removed'), true);
+  assert.equal(screenshots[5][1].includes('retained'), true);
+  assert.match(screenshots[6][1], /review before public sharing/i);
+  assert.match(screenshots[7][1], /limited to the selected executable/i);
+  assert.match(screenshots[8][1], /three-of-three.*active PATH CLI remains NOT TESTED/i);
+});
+
+test('all fifteen public PNGs are structurally valid and free of metadata-bearing chunks', () => {
+  const docsRoot = fileURLToPath(new URL('../docs/', import.meta.url));
+  const pngFiles = fs.readdirSync(path.join(docsRoot, 'assets')).filter((name) => name.endsWith('.png')).map((name) => path.join(docsRoot, 'assets', name))
+    .concat(fs.readdirSync(path.join(docsRoot, 'screenshots')).filter((name) => name.endsWith('.png')).map((name) => path.join(docsRoot, 'screenshots', name)));
+  assert.equal(pngFiles.length, 15);
+  const allowedChunks = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'sRGB', 'gAMA', 'pHYs']);
+  const forbiddenChunks = new Set(['caBX', 'eXIf', 'iCCP', 'iTXt', 'tEXt', 'zTXt']);
+  const forbiddenMetadataText = ['ann-d', 'c:\\users', 'appdata', 'c2pa', 'jumbf', 'openai-media-service', 'urn:uuid', '-----begin'];
+  for (const file of pngFiles) {
+    const chunks = readPngChunks(file);
+    for (const chunk of chunks) {
+      assert.equal(allowedChunks.has(chunk.type), true, `${path.basename(file)}: unexpected ${chunk.type}`);
+      assert.equal(forbiddenChunks.has(chunk.type), false, `${path.basename(file)}: ${chunk.type}`);
+      if (!['IDAT', 'PLTE'].includes(chunk.type)) {
+        const metadataText = chunk.payload.toString('latin1').toLowerCase();
+        for (const marker of forbiddenMetadataText) assert.equal(metadataText.includes(marker), false, `${path.basename(file)}: ${marker}`);
+      }
+    }
+  }
+  const heroChunks = readPngChunks(path.join(docsRoot, 'assets', 'codex-safety-canary-hero.png')).map((chunk) => chunk.type);
+  assert.deepEqual([...new Set(heroChunks)], ['IHDR', 'IDAT', 'IEND']);
+});
+
 test('share-safe sanitization replaces known paths and usernames case-insensitively', () => {
   const report = {
     generatedAt: '2026-01-01T00:00:00Z',
@@ -589,11 +1630,11 @@ test('share-safe sanitization replaces known paths and usernames case-insensitiv
   });
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /Alice/i);
-  assert.match(serialized, /%CODEX_HOME%|\[USER\]/);
+  assert.equal(payload.execpolicy[0].errorPresent, true);
 });
 
 test('share-safe sanitization redacts report-scoped project paths and cleanup text', () => {
-  const projectRoot = 'C:\\Users\\Alice\\Documents\\Codex-Lokal\\Projekte\\codex-safety-canary-v0.1.0-alpha.10';
+  const projectRoot = 'C:\\Users\\Alice\\Documents\\Codex-Lokal\\Projekte\\codex-safety-canary-v0.1.0-alpha.11';
   const report = {
     generatedAt: '2026-01-01T00:00:00Z',
     tool: { name: 'Canary', version: 'x' },
@@ -609,7 +1650,7 @@ test('share-safe sanitization redacts report-scoped project paths and cleanup te
       id: 'x', label: 'x', status: 'ERROR', decision: null,
       error: `Project path ${path.join(projectRoot, 'README.md')} belongs to Alice`,
     }],
-    sandbox: { cleanup: `Cleaned ${projectRoot}`, probes: [], status: 'COMPLETED' },
+    sandbox: { cleanup: { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: `Cleaned ${projectRoot}` }, probes: [], status: 'COMPLETED' },
   };
   const payload = buildSupportPayload(report, {
     CODEX_HOME: 'C:\\Users\\Alice\\.codex',
@@ -620,7 +1661,66 @@ test('share-safe sanitization redacts report-scoped project paths and cleanup te
   assert.doesNotMatch(serialized, /Alice/i);
   assert.doesNotMatch(serialized, /Codex-Lokal/i);
   assert.doesNotMatch(serialized, /codex-safety-canary-v0\.1\.0-alpha\.10/i);
+  assert.equal(payload.execpolicy[0].errorPresent, true);
+  assert.deepEqual(payload.sandbox.cleanup, { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, valid: true });
+});
+
+test('share-safe path scanner fully redacts quoted, unquoted, UNC, and multiple Windows paths with spaces', () => {
+  const normalText = "Normal text, Inc.; O'Brien said Archive remains unchanged.";
+  const secretLines = [
+    'D:\\Client, Inc\\reports\\private.log',
+    'D:\\Research; Archive\\secret.txt',
+    "D:\\O'Brien\\Client Alpha\\private.log",
+    '"D:\\Client, Inc\\reports\\private.log"',
+    '"D:\\Research; Archive\\secret.txt"',
+    '"D:\\O\'Brien\\Client Alpha\\private.log"',
+    "'D:\\Client, Inc\\reports\\private.log'",
+    "'D:\\Research; Archive\\secret.txt'",
+    "'D:\\O'Brien\\Client Alpha\\private.log'",
+    "\\\\fileserver\\Client, Inc; O'Brien\\Client Alpha\\private.log",
+    "multiple D:\\Client, Inc\\reports\\private.log and E:/Research; Archive/O'Brien/secret.txt",
+    'D:\\KnownRoot, Inc\\reports\\private.log',
+    'D:\\KnownRoot; Archive\\secret.txt',
+    "D:\\KnownRoot'Brien\\Client Alpha\\private.log",
+  ];
+  const report = {
+    generatedAt: '2026-01-01T00:00:00Z',
+    tool: { name: 'Canary', version: 'x' },
+    summary: {
+      overall: 'TEST ERROR / INCOMPLETE', boundary: 'TEST ERROR', sandboxRuntime: 'FAILED', workspaceDeletion: 'NOT TESTED', methodCoverage: 'NOT RUN',
+      execpolicyCoverage: { status: 'NOT_RUN', matched: null, total: null }, recommendations: [], interpretation: [...secretLines], nextSteps: [], riskWarnings: [...secretLines],
+      activeCli: { bundleStatus: 'INCOMPLETE', boundaryStatus: 'NOT TESTED' }, testedBundle: null,
+    },
+    inventory: {
+      platform: 'win32', release: 'x', nodeVersion: 'x', nodeRuntimeSource: 'PATH', nodeInPath: true, npmInPath: false,
+      elevated: false, codexInstalled: true, codexVersion: 'x', activeBundle: { complete: false, missing: [] }, standalonePackages: [],
+      matchingCompleteBundles: [], newerCompleteBundles: [], ruleFiles: [], sandboxWindowsState: 'AVAILABLE',
+      config: { warnings: [...secretLines] },
+    },
+    execpolicy: [], sandbox: null,
+  };
+  const payload = buildSupportPayload(report, { CODEX_HOME: 'D:\\KnownRoot' });
+  const serialized = `${JSON.stringify(payload)}\n${renderSupportReport(payload)}`;
+  for (const marker of ['Inc', 'Archive', "O'Brien", 'Client Alpha', 'private.log', 'secret.txt', 'fileserver']) {
+    assert.equal(serialized.includes(marker), false, `unexpected share-safe marker: ${marker}`);
+  }
+  const supportStrings = [];
+  const collectStrings = (value) => {
+    if (typeof value === 'string') supportStrings.push(value);
+    else if (Array.isArray(value)) value.forEach(collectStrings);
+    else if (value && typeof value === 'object') Object.values(value).forEach(collectStrings);
+  };
+  collectStrings(payload);
+  assert.equal(supportStrings.some((value) => value.includes('\\')), false);
   assert.match(serialized, /%LOCAL_PATH%/);
+
+  const normalReport = {
+    ...report,
+    summary: { ...report.summary, interpretation: [normalText], riskWarnings: [] },
+    inventory: { ...report.inventory, config: { warnings: [] } },
+  };
+  const normalPayload = buildSupportPayload(normalReport, { CODEX_HOME: 'D:\\KnownRoot' });
+  assert.equal(normalPayload.summary.interpretation[0], normalText);
 });
 
 test('writeReport creates detailed and share-safe report files', () => {
@@ -639,6 +1739,87 @@ test('writeReport creates detailed and share-safe report files', () => {
   assert.equal(fs.existsSync(result.supportJsonPath), true);
   const latest = JSON.parse(fs.readFileSync(path.join(appRoot, 'reports', 'latest.json'), 'utf8'));
   assert.equal(latest.supportTxtPath, result.supportTxtPath);
+  fs.rmSync(appRoot, { recursive: true, force: true });
+});
+
+test('writeReport recursively redacts host-preflight and nested local paths from share-safe files', () => {
+  const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-support-redaction-'));
+  const userRoot = 'C:\\Users\\Alice';
+  const projectRoot = `${userRoot}\\Documents\\Codex-Lokal\\Projekte\\codex-safety-canary-v0.1.0-alpha.11`;
+  const inventory = {
+    platform: 'win32', release: 'x', nodeVersion: 'x', nodeRuntimeSource: 'PATH', nodeInPath: true, npmInPath: true,
+    elevated: false, codexInstalled: true, codexVersion: 'x', activeCodexPath: `${userRoot}\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe`,
+    activeBundle: { complete: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', missing: [] },
+    matchingCompleteBundles: [], newerCompleteBundles: [], standalonePackages: [],
+    codexHome: `${userRoot}\\.codex`, authFilePresent: false,
+    doctor: { status: 'FAILED', ok: false, error: `${userRoot}\\.codex\\doctor.log` },
+    ruleFiles: [`${userRoot}\\.codex\\rules\\default.rules`], sandboxWindowsState: 'AVAILABLE', sandboxHelpError: null,
+    config: {
+      exists: true, path: `${userRoot}\\.codex\\config.toml`, sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null,
+      warnings: [
+        'D:\\Client, Inc\\reports\\private.log',
+        'D:\\Research; Archive\\secret.txt',
+        "D:\\O'Brien\\Client Alpha\\private.log",
+        "\\\\fileserver\\Client, Inc; O'Brien\\Client Alpha\\private.log",
+      ],
+    },
+  };
+  const rules = [{ label: 'synthetic', command: ['test'], status: 'ERROR', decision: null, error: `${projectRoot}\\reports\\execpolicy.log` }];
+  const sandbox = {
+    status: 'HOST_PREFLIGHT_FAILED', codexSource: 'ACTIVE_CLI', probes: [],
+    hostPreflight: { passed: false, filesChecked: 1, error: `${userRoot}\\AppData\\Local\\CodexSafetyCanary\\runs\\run-1\\preflight.log failed` },
+    smoke: { passed: false, commandExitCode: 1, setupFailure: false, stderr: `${projectRoot}\\runs\\smoke.log` },
+    error: `${projectRoot}\\runs\\sandbox-error.log`,
+    cleanup: `Cleanup failed for ${projectRoot}\\runs\\run-1`,
+  };
+
+  const result = writeReport({ inventory, rules, sandbox, appRoot });
+  const supportJson = JSON.parse(fs.readFileSync(result.supportJsonPath, 'utf8'));
+  const supportText = fs.readFileSync(result.supportTxtPath, 'utf8');
+  const serialized = `${JSON.stringify(supportJson)}\n${supportText}`;
+  const forbidden = /Alice|C:\\Users|AppData|\.codex|Codex-Lokal|codex-safety-canary-v0\.1\.0-alpha\.11|\bInc\b|Archive|O'Brien|Client Alpha|private\.log|secret\.txt|fileserver|reports\\|runs\\|\.log\b/i;
+
+  assert.doesNotMatch(serialized, forbidden);
+  assert.deepEqual(supportJson.sandbox.hostPreflight, {
+    status: 'FAILED',
+    passed: false,
+    filesChecked: 1,
+    errorPresent: true,
+  });
+  assert.equal(supportJson.summary.boundary, 'TEST ERROR');
+  assert.equal(supportJson.summary.sandboxRuntime, 'HOST PREFLIGHT FAILED');
+  fs.rmSync(appRoot, { recursive: true, force: true });
+});
+
+test('share-safe reports include calibration and evidence status without paths or raw errors', () => {
+  const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-calibration-report-'));
+  const secretPath = 'C:\\Users\\Alice\\AppData\\Local\\CodexSafetyCanary\\runs\\run-1\\control\\powershell-outside.txt';
+  const probes = completeBoundaryProbes();
+  const powershellOutside = probes.find((probe) => probe.method === 'powershell' && probe.location === 'outside');
+  Object.assign(powershellOutside, {
+    hostCalibrationStatus: 'PASS', targetIdentityStatus: 'MATCHED',
+    operation: 'System.IO.File.Delete', exceptionType: 'System.UnauthorizedAccessException',
+    errorClass: 'System.UnauthorizedAccessException', errorCategory: 'PermissionDenied',
+    errorHResult: -2147024891, nativeWin32ErrorCode: 5,
+    errorTarget: secretPath, targetPath: secretPath, errorMessage: `Access denied ${secretPath}`,
+  });
+  const inventory = {
+    platform: 'win32', release: 'x', nodeVersion: 'x', nodeRuntimeSource: 'PATH', nodeInPath: true, npmInPath: false,
+    elevated: false, codexInstalled: true, codexVersion: 'x', activeCodexPath: 'C:\\Users\\Alice\\codex.exe',
+    activeBundle: { complete: true, resourceLayout: 'COMPLETE' }, standalonePackages: [], matchingCompleteBundles: [], newerCompleteBundles: [],
+    codexHome: 'C:\\Users\\Alice\\.codex', authFilePresent: false, doctor: null, ruleFiles: [], sandboxWindowsState: 'AVAILABLE',
+    config: { exists: false, path: 'C:\\Users\\Alice\\.codex\\config.toml', warnings: [] },
+  };
+  const result = writeReport({ inventory, sandbox: completedBoundarySandbox({ probes }), appRoot });
+  const supportText = fs.readFileSync(result.supportTxtPath, 'utf8');
+  const supportJsonText = fs.readFileSync(result.supportJsonPath, 'utf8');
+  const combined = `${supportText}\n${supportJsonText}`;
+  assert.match(combined, /Host calibration powershell: PASS/i);
+  assert.match(combined, /System\.IO\.File\.Delete/i);
+  assert.match(combined, /System\.UnauthorizedAccessException/i);
+  assert.match(combined, /native Win32[^\n]*5/i);
+  assert.match(combined, /target identity[=:]MATCHED/i);
+  assert.doesNotMatch(combined, /Alice|AppData|Invalid path|powershell-outside\.txt|C:\\/i);
   fs.rmSync(appRoot, { recursive: true, force: true });
 });
 test('detached process launcher waits for spawn before unref', async () => {
@@ -697,6 +1878,50 @@ test('execpolicy coverage is structured and formats NOT RUN or x/y', () => {
   assert.equal(formatExecpolicyCoverage(completed.execpolicyCoverage), '1/2');
 });
 
+test('unknown execpolicy schema stays visible without affecting a valid boundary result', () => {
+  const inventory = {
+    platform: 'win32', release: 'synthetic', nodeVersion: 'synthetic', nodeRuntimeSource: 'TEST', nodeInPath: true, npmInPath: false,
+    elevated: false, codexInstalled: true, codexVersion: 'codex-cli synthetic', activeCodexPath: null,
+    activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', missing: [] },
+    standalonePackages: [], matchingCompleteBundles: [], newerCompleteBundles: [], ruleFiles: [], sandboxWindowsState: 'AVAILABLE',
+    config: { exists: false, sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null, warnings: [] },
+  };
+  const rules = [{
+    id: 'schema-check', label: 'Synthetic schema check', command: ['synthetic'], status: 'UNKNOWN_SCHEMA', decision: null,
+    raw: { metadata: { first: 'allow', later: 'forbidden' } }, error: 'No recognized top-level execpolicy decision field was present.',
+  }];
+  const sandbox = completedBoundarySandbox();
+  const summary = summarizeAssessment(inventory, rules, sandbox, { execpolicyRun: true });
+  assert.equal(summary.boundary, 'PASS');
+  assert.deepEqual(summary.execpolicyCoverage, { status: 'UNKNOWN_SCHEMA', matched: null, total: 1 });
+  assert.equal(summary.recommendations.some((item) => item.code === 'EXECPOLICY_NO_RESTRICTIVE_MATCHES'), false);
+  const report = {
+    generatedAt: '2026-07-31T00:00:00Z', tool: { name: 'Canary', version: '0.1.0-alpha.11' }, assessmentMode: ASSESSMENT_MODES.GUIDED,
+    inventory, summary, execpolicy: rules, sandbox,
+  };
+  const detailText = renderTextReport(report);
+  const supportPayload = buildSupportPayload(report, {});
+  const supportText = renderSupportReport(supportPayload);
+  assert.match(detailText, /Execpolicy coverage:\s+UNKNOWN_SCHEMA/i);
+  assert.match(detailText, /Synthetic schema check: UNKNOWN_SCHEMA/i);
+  assert.match(supportText, /Execpolicy rule coverage:\s+UNKNOWN_SCHEMA/i);
+  assert.equal(supportPayload.execpolicy[0].status, 'UNKNOWN_SCHEMA');
+  assert.equal(supportPayload.summary.boundary, 'PASS');
+  assert.doesNotMatch(`${detailText}\n${supportText}`, /NO_MATCH|NO MATCH/);
+});
+
+test('invalid execpolicy JSON remains a parsing error', () => {
+  assert.throws(() => parseExecpolicyOutput('{not-json'), SyntaxError);
+});
+
+test('boundary documentation never describes incomplete evidence as a partial pass', () => {
+  const files = ['../README.md', '../docs/TEST_PLAN.md', '../FAQ.md', '../SECURITY.md'];
+  for (const file of files) {
+    const document = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+    assert.doesNotMatch(document, /partial[^.\n]{0,50}\bpass\b/i);
+  }
+});
+
 test('declined live probes use a dedicated diagnostic and mode-specific coverage', () => {
   const guidedDeclined = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [{ decision: null }], null, { assessmentMode: ASSESSMENT_MODES.GUIDED_LIVE_PROBES_SKIPPED, execpolicyRun: true, boundaryAssessmentDeclined: true });
   assert.equal(guidedDeclined.overall, 'PARTIAL / LIVE PROBES DECLINED');
@@ -728,42 +1953,34 @@ test('configuration and execpolicy-only modes report boundary as intentionally n
   assert.equal(execpolicyOnly.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED'), false);
 });
 
-test('recommendation severities follow the alpha-10 diagnostic matrix', () => {
-  const activePass = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], {
-    status: 'COMPLETED', codexSource: 'ACTIVE_CLI', probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-    ],
-  });
+test('recommendation severities follow the alpha-11 diagnostic matrix', () => {
+  const activePass = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], completedBoundarySandbox());
   assert.equal(activePass.recommendations.find((item) => item.code === 'ACTIVE_BUNDLE_BOUNDARY_PASS')?.severity, 'INFO');
 
-  const alternativePass = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: false }, codexVersion: 'x' }, [], {
-    status: 'COMPLETED', codexSource: 'NEWER_COMPLETE_BUNDLE', versionMismatch: true, testedCodexVersion: 'y', activeCodexVersion: 'x', probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
-    ],
-  });
+  const alternativePass = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: false }, codexVersion: 'x' }, [], completedBoundarySandbox({
+    codexSource: 'NEWER_COMPLETE_BUNDLE', versionMismatch: true, testedCodexVersion: 'y', activeCodexVersion: 'x',
+  }));
   assert.equal(alternativePass.recommendations.find((item) => item.code === 'ALTERNATIVE_BUNDLE_BOUNDARY_PASS')?.severity, 'INFO');
   assert.equal(alternativePass.recommendations.find((item) => item.code === 'ACTIVE_CLI_BUNDLE_INCOMPLETE')?.severity, 'ACTION_RECOMMENDED');
 
   const setupFailed = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED' }, [], { status: 'SETUP_FAILED', probes: [] });
   assert.equal(setupFailed.recommendations.find((item) => item.code === 'SANDBOX_SETUP_FAILED')?.severity, 'ACTION_RECOMMENDED');
   assert.equal(setupFailed.recommendations.find((item) => item.code === 'BOUNDARY_NOT_CONFIRMED')?.severity, 'PROTECTION_NOT_CONFIRMED');
-  const invalidControl = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], {
-    status: 'COMPLETED', codexSource: 'ACTIVE_CLI', probes: [
+  const invalidControl = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], completedBoundarySandbox({
+    probes: [
       { method: 'powershell', location: 'inside', assessment: 'UNEXPECTED', observed: 'RETAINED' },
       { method: 'powershell', location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
     ],
-  });
+  }));
   assert.equal(invalidControl.recommendations.find((item) => item.code === 'BOUNDARY_NOT_CONFIRMED')?.severity, 'PROTECTION_NOT_CONFIRMED');
 
-  const gap = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], {
-    status: 'COMPLETED', codexSource: 'ACTIVE_CLI', probes: [
-      { method: 'powershell', location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-      { method: 'powershell', location: 'outside', assessment: 'CRITICAL_GAP', observed: 'DELETED' },
-    ],
-  });
+  const gap = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [], completedBoundarySandbox({
+    probes: completeBoundaryProbes({ gapMethod: 'powershell' }),
+  }));
   assert.equal(gap.recommendations.find((item) => item.code === 'BOUNDARY_GAP')?.severity, 'POTENTIAL_SECURITY_GAP');
+  assert.equal(gap.boundary, 'GAP');
+  assert.equal(gap.methodCoverage, '2/3');
+  assert.equal(gap.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED'), false);
 
   const noRules = summarizeAssessment({ config: { warnings: [] }, activeBundle: { complete: true }, codexVersion: 'x' }, [{ decision: null }], null, { execpolicyRun: true });
   assert.equal(noRules.recommendations.find((item) => item.code === 'EXECPOLICY_NO_RESTRICTIVE_MATCHES')?.severity, 'OPTIONAL_HARDENING');
@@ -809,4 +2026,955 @@ test('detail and support reports share diagnostic recommendations', () => {
     assert.match(supportText, new RegExp(label));
     assert.deepEqual(support.recommendations.find((item) => `${item.severity} ${item.code}` === label), report.summary.recommendations.find((item) => `${item.severity} ${item.code}` === label));
   }
+});
+
+test('standalone release versions are parsed from Windows release directory names', () => {
+  assert.equal(parseStandaloneReleaseVersion('0.146.0-x86_64-pc-windows-msvc'), '0.146.0');
+  assert.equal(parseStandaloneReleaseVersion('0.146.0-alpha.3-x86_64-pc-windows-msvc'), '0.146.0-alpha.3');
+  assert.equal(parseStandaloneReleaseVersion('not-a-version'), null);
+});
+
+test('standalone package discovery records resources separately from classic bundle layout', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-'));
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-resources'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-path'), { recursive: true });
+  const executable = path.join(release, 'bin', 'codex.exe');
+  fs.writeFileSync(executable, 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-path', 'rg.exe'), 'synthetic');
+
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 1);
+  assert.equal(packages[0].releaseVersion, '0.146.0');
+  assert.equal(packages[0].resourcesFound, true);
+  assert.equal(packages[0].requiredResourcesPresent, true);
+
+  const bundle = inspectCodexBundle(executable, { codexHome, standalonePackages: packages });
+  assert.equal(bundle.installType, 'standalone');
+  assert.equal(bundle.helperLayout, 'STANDALONE_RESOURCES');
+  assert.equal(bundle.complete, false);
+  assert.equal(bundle.probeEligible, true);
+  assert.equal(bundle.resourceLayout, 'COMPLETE');
+  assert.equal(bundle.helperResolution, 'NOT_TESTED');
+  assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
+  assert.equal(bundle.helperResolutionProven, false);
+  assert.equal(bundle.standaloneRequiredResourcesPresent, true);
+
+  const env = { CODEX_HOME: codexHome, LOCALAPPDATA: path.join(codexHome, 'LocalAppData') };
+  assert.deepEqual(discoverCodexBundlePaths(env, { platform: 'win32' }).map((item) => path.basename(item)), ['codex.exe']);
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('active launcher with matching standalone resources is not treated as a proven live-probe bundle', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-launcher-'));
+  const codexHome = path.join(root, '.codex');
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const launcherDir = path.join(root, 'LocalAppData', 'Programs', 'OpenAI', 'Codex', 'bin');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-resources'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-path'), { recursive: true });
+  fs.mkdirSync(launcherDir, { recursive: true });
+  fs.writeFileSync(path.join(release, 'bin', 'codex.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-path', 'rg.exe'), 'synthetic');
+  const activeLauncher = path.join(launcherDir, 'codex.exe');
+  fs.writeFileSync(activeLauncher, 'synthetic launcher');
+
+  const packages = discoverStandalonePackages(codexHome);
+  const bundle = inspectCodexBundle(activeLauncher, { codexHome, activeVersion: 'codex-cli 0.146.0', standalonePackages: packages });
+  assert.equal(bundle.complete, false);
+  assert.equal(bundle.installType, 'standalone');
+  assert.equal(bundle.standaloneResourcesFound, true);
+  assert.equal(bundle.resourceLayout, 'COMPLETE');
+  assert.equal(bundle.helperResolution, 'NOT_TESTED');
+  assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
+  assert.equal(bundle.helperResolutionProven, false);
+  assert.equal(bundle.resourceVersionMatchesActive, true);
+
+  const diagnostics = buildRuntimeDiagnostics({
+    activeBundle: bundle,
+    standalonePackages: packages,
+    sandboxHelpError: 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe program not found',
+    sandboxHelpRuntimeEvidence: buildSandboxRuntimeEvidence(
+      'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe program not found',
+      { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' }
+    ),
+  }, null);
+  assert.equal(diagnostics.find((item) => item.code === 'STANDALONE_RESOURCES_FOUND')?.severity, 'INFO');
+  assert.equal(diagnostics.find((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED')?.severity, 'ACTION_RECOMMENDED');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('foreign standalone resources do not create an active-CLI runtime diagnostic', () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-mismatch-'));
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const active = path.join(codexHome, 'active', 'codex.exe');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-resources'), { recursive: true });
+  fs.mkdirSync(path.dirname(active), { recursive: true });
+  fs.writeFileSync(path.join(release, 'bin', 'codex.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  fs.writeFileSync(active, 'synthetic');
+  const packages = discoverStandalonePackages(codexHome);
+  const bundle = inspectCodexBundle(active, { codexHome, activeVersion: 'codex-cli 0.145.0', standalonePackages: packages });
+  assert.equal(bundle.complete, false);
+  assert.equal(bundle.standaloneResourcesFound, false);
+  assert.equal(bundle.resourceVersionMatchesActive, null);
+  const diagnostics = buildRuntimeDiagnostics({
+    codexVersion: 'codex-cli 0.145.0',
+    activeBundle: bundle,
+    standalonePackages: packages,
+    sandboxHelpError: 'orchestrator_helper_launch_failed: program not found',
+  }, null);
+  assert.equal(packages.length, 1);
+  assert.equal(diagnostics.some((item) => item.code === 'STANDALONE_RESOURCES_FOUND' && item.target === 'ACTIVE_CLI'), false);
+  assert.equal(diagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), false);
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('command runner process creation failures are distinct from helper resolution failures', () => {
+  const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
+  const runtimeEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' });
+  assert.equal(detectCommandRunnerProcessCreationFailure(error), false);
+  assert.equal(detectCommandRunnerProcessCreationFailure(error, runtimeEvidence), true);
+  assert.equal(detectSandboxHelperResolutionFailure(error), false);
+  const inventory = {
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: { complete: true, probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+    doctor: { ok: true },
+    sandboxWindowsState: 'AVAILABLE',
+  };
+  const summary = summarizeAssessment(inventory, [], { status: 'SETUP_FAILED', codexSource: 'ACTIVE_CLI', testedCodexVersion: 'codex-cli 0.146.0', probes: [], runtimeEvidence, error });
+  assert.equal(summary.sandboxRuntime, 'FAILED – PROCESS CREATION FAILED');
+  assert.equal(summary.activeCli.helperResolution, 'CONFIRMED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.activeCli.boundaryStatus, 'TEST ERROR');
+  assert.equal(summary.testedBundle.helperResolution, 'CONFIRMED');
+  assert.equal(summary.testedBundle.runtimeStartup, 'FAILED');
+  assert.equal(summary.testedBundle.boundaryStatus, 'TEST ERROR');
+  assert.equal(summary.recommendations.find((item) => item.code === 'COMMAND_RUNNER_PROCESS_CREATION_FAILED')?.severity, 'PROTECTION_NOT_CONFIRMED');
+  assert.equal(summary.recommendations.find((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED')?.severity, 'PROTECTION_NOT_CONFIRMED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+});
+
+test('unbound process-creation text never confirms helper resolution', () => {
+  const messages = [
+    'unrelated diagnostic subsystem: CreateProcessWithLogonW failed: 2',
+    'foreign diagnostics begin; codex-command-runner.exe CreateProcessWithLogonW failed: 2; foreign diagnostics end',
+    'codex-command-runner.exe CreateProcessWithLogonW failed: 2',
+  ];
+  for (const sandboxHelpError of messages) {
+    const observation = deriveSandboxRuntimeObservation({
+      sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED',
+      sandboxSetupFailed: true,
+      sandboxHelpError,
+      activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+    }, null);
+    assert.equal(observation.helperResolution, 'NOT_TESTED');
+    assert.equal(observation.runtimeStartup, 'FAILED');
+    assert.equal(observation.commandRunnerProcessCreationFailed, false);
+  }
+});
+
+test('bound runtime evidence stays scoped to the selected executable', () => {
+  const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
+  const activeEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' });
+  const mismatched = deriveSandboxRuntimeObservation({
+    activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+  }, {
+    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', runtimeEvidence: activeEvidence,
+    testedBundleMetadata: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' }, error,
+  });
+  assert.equal(mismatched.helperResolution, 'NOT_TESTED');
+  assert.equal(mismatched.runtimeStartup, 'FAILED');
+
+  const testedEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE' });
+  const matched = deriveSandboxRuntimeObservation({}, {
+    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', runtimeEvidence: testedEvidence,
+    testedBundleMetadata: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' }, error,
+  });
+  assert.equal(matched.helperResolution, 'CONFIRMED');
+  assert.equal(matched.runtimeStartup, 'FAILED');
+});
+
+test('explicit bound setup-helper evidence fails helper resolution without a boundary pass', () => {
+  const error = 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT';
+  const summary = summarizeAssessment({
+    config: { warnings: [] }, sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED', sandboxSetupFailed: true,
+    sandboxHelpError: error,
+    sandboxHelpRuntimeEvidence: buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' }),
+    activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', resourceLayout: 'COMPLETE' },
+  }, [], null, { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false });
+  assert.equal(summary.activeCli.helperResolution, 'FAILED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+});
+
+test('alternative standalone command-runner failure confirms helper resolution but not runtime or boundary', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.145.0',
+    config: { warnings: [] },
+    activeBundle: { complete: false, probeEligible: false, installType: 'classic', resourceLayout: 'MISSING', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+    sandboxWindowsState: 'AVAILABLE',
+  }, [], {
+    status: 'SETUP_FAILED',
+    codexSource: 'NEWER_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.146.0',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    versionMismatch: true,
+    testedBundleMetadata: {
+      installType: 'standalone', complete: false, probeEligible: true,
+      resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true, standaloneRequiredResourcesPresent: true, releaseVersion: '0.146.0',
+    },
+    smoke: { passed: false, stderr: 'CreateProcessWithLogonW failed: 2' },
+    probes: [],
+    runtimeEvidence: buildSandboxRuntimeEvidence('codex-command-runner.exe CreateProcessWithLogonW failed: 2', {
+      step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE',
+    }),
+    error: 'codex-command-runner.exe CreateProcessWithLogonW failed: 2',
+  }, { execpolicyRun: false });
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.testedBundle.resourceLayout, 'COMPLETE');
+  assert.equal(summary.testedBundle.helperResolution, 'CONFIRMED');
+  assert.equal(summary.testedBundle.runtimeStartup, 'FAILED');
+  assert.equal(summary.testedBundle.boundaryStatus, 'TEST ERROR');
+  assert.equal(summary.recommendations.find((item) => item.code === 'COMMAND_RUNNER_PROCESS_CREATION_FAILED')?.severity, 'PROTECTION_NOT_CONFIRMED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+});
+
+test('codex doctor is read-only inventory evidence and invalid output is non-fatal', () => {
+  const ok = parseCodexDoctorOutput({ status: 0, stdout: JSON.stringify({ overallStatus: 'ok', checks: { installation: { status: 'ok' }, runtime: { status: 'ok' } } }), stderr: '' });
+  assert.equal(ok.status, 'COMPLETED');
+  assert.equal(ok.ok, true);
+  assert.equal(ok.installationStatus, 'ok');
+  const invalid = parseCodexDoctorOutput({ status: 0, stdout: 'not-json', stderr: '' });
+  assert.equal(invalid.status, 'INVALID_JSON');
+  assert.equal(invalid.ok, false);
+  const failed = parseCodexDoctorOutput({ status: 1, stdout: '', stderr: 'doctor failed' });
+  assert.equal(failed.status, 'FAILED');
+});
+
+test('share-safe payload redacts standalone paths and nested sandbox diagnostics', () => {
+  const userRoot = 'C:\\Users\\Alice';
+  const codexHome = `${userRoot}\\.codex`;
+  const releaseDir = `${codexHome}\\packages\\standalone\\releases\\0.146.0-x86_64-pc-windows-msvc`;
+  const report = {
+    generatedAt: '2026-01-01T00:00:00Z',
+    tool: { name: 'Canary', version: 'x' },
+    assessmentMode: ASSESSMENT_MODES.GUIDED,
+    summary: {
+      overall: 'TEST ERROR / INCOMPLETE',
+      boundary: 'TEST ERROR',
+      sandboxRuntime: 'FAILED – HELPER NOT RESOLVABLE',
+      workspaceDeletion: 'NOT TESTED',
+      methodCoverage: 'NOT RUN',
+      execpolicyCoverage: { status: 'NOT_RUN', matched: null, total: null },
+      riskWarnings: [],
+      activeCli: { bundleStatus: 'STANDALONE RESOURCES PRESENT – LAUNCHER RESOLUTION NOT CONFIRMED', boundaryStatus: 'NOT TESTED' },
+      testedBundle: null,
+      runtimeDiagnostics: [],
+      recommendations: [],
+      interpretation: [],
+      nextSteps: [],
+    },
+    inventory: {
+      platform: 'win32', release: 'x', nodeVersion: 'x', nodeRuntimeSource: 'PATH', nodeInPath: true, npmInPath: true, elevated: false,
+      codexInstalled: true, codexVersion: 'codex-cli 0.146.0', activeCodexPath: `${userRoot}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe`, codexHome, authFilePresent: false,
+      activeBundle: {
+        complete: false,
+        missing: ['codex-windows-sandbox-setup.exe'],
+        installType: 'standalone',
+        helperLayout: 'STANDALONE_RESOURCES',
+        standaloneResourcesFound: true,
+        standaloneRequiredResourcesPresent: true,
+        standalonePackage: {
+          releaseDir,
+          binDir: `${releaseDir}\\bin`,
+          codexResourcesDir: `${releaseDir}\\codex-resources`,
+          codexPathDir: `${releaseDir}\\codex-path`,
+          executablePath: `${releaseDir}\\bin\\codex.exe`,
+          files: { setupHelper: `${releaseDir}\\codex-resources\\codex-windows-sandbox-setup.exe` },
+        },
+      },
+      standalonePackages: [{ source: 'release', releaseVersion: '0.146.0', resourcesFound: true, codexPathFound: true, requiredResourcesPresent: true, requiredResourcesMissing: [], optionalResourcesMissing: [] }],
+      doctor: { status: 'COMPLETED', ok: true, overallStatus: 'ok', error: `${releaseDir}\\codex-resources\\codex-windows-sandbox-setup.exe` },
+      matchingCompleteBundles: [], newerCompleteBundles: [], ruleFiles: [`${codexHome}\\rules\\danger.rules`],
+      config: { exists: true, path: `${codexHome}\\config.toml`, warnings: [] },
+      sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED', sandboxHelpError: `${releaseDir}\\codex-resources\\codex-windows-sandbox-setup.exe program not found`,
+    },
+    execpolicy: [],
+    sandbox: { status: 'SETUP_FAILED', probes: [], error: `${releaseDir}\\codex-command-runner.exe CreateProcessWithLogonW failed: 2`, cleanup: `${userRoot}\\AppData\\Local\\Temp\\runs` },
+  };
+  const payload = buildSupportPayload(report, { CODEX_HOME: codexHome, LOCALAPPDATA: `${userRoot}\\AppData\\Local`, APPDATA: `${userRoot}\\AppData\\Roaming` });
+  const serialized = JSON.stringify(payload);
+  assert.doesNotMatch(serialized, /Alice/);
+  assert.doesNotMatch(serialized, /C:\\Users/i);
+  assert.doesNotMatch(serialized, /AppData/i);
+  assert.doesNotMatch(serialized, /config\.toml/i);
+  assert.doesNotMatch(serialized, /codex\.exe/i);
+  assert.doesNotMatch(serialized, /0\.146\.0-x86_64-pc-windows-msvc/i);
+  assert.doesNotMatch(serialized, /danger\.rules/i);
+});
+
+test('standalone resources without smoke are not complete and do not prove helper resolution', () => {
+  const inventory = {
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: {
+      complete: false,
+      probeEligible: true,
+      installType: 'standalone',
+      helperLayout: 'STANDALONE_RESOURCES',
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      helperResolutionProven: false,
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+    },
+  };
+  const summary = summarizeAssessment(inventory, [], null, { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false });
+  assert.equal(summary.activeCli.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION NOT TESTED');
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.activeCli.runtimeStartup, 'NOT_TESTED');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.activeCli.bundleStatus.includes('COMPLETE'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_CLI_BUNDLE_INCOMPLETE'), false);
+  assert.doesNotMatch(summary.nextSteps.join('\n'), /update or reinstall/i);
+  assert.match(summary.nextSteps.join('\n'), /controlled runtime preflight/i);
+});
+
+function standaloneInventoryWithSandboxHelp(error = null, state = 'AVAILABLE_BUT_SETUP_FAILED') {
+  return {
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    doctor: { ok: true },
+    sandboxWindowsState: state,
+    sandboxSetupFailed: state === 'AVAILABLE_BUT_SETUP_FAILED',
+    sandboxHelpError: error,
+    sandboxHelpRuntimeEvidence: error
+      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' })
+      : null,
+    activeBundle: {
+      complete: false,
+      probeEligible: true,
+      installType: 'standalone',
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+      resourceVersionMatchesActive: true,
+      standalonePackage: { releaseVersion: '0.146.0' },
+    },
+    standalonePackages: [],
+  };
+}
+
+test('configuration-only preserves setup-helper resolution failure observed during sandbox help inventory', () => {
+  const summary = summarizeAssessment(
+    standaloneInventoryWithSandboxHelp('orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT'),
+    [],
+    null,
+    { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false }
+  );
+  assert.equal(summary.activeCli.helperResolution, 'FAILED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.sandboxRuntime, 'FAILED – HELPER NOT RESOLVABLE');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+});
+
+test('guided decline preserves sandbox-help runtime failure while declining only later boundary probes', () => {
+  const summary = summarizeAssessment(
+    standaloneInventoryWithSandboxHelp('orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT'),
+    [],
+    null,
+    { assessmentMode: ASSESSMENT_MODES.GUIDED_LIVE_PROBES_SKIPPED, execpolicyRun: true, boundaryAssessmentDeclined: true }
+  );
+  assert.equal(summary.activeCli.helperResolution, 'FAILED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.sandboxRuntime, 'FAILED – HELPER NOT RESOLVABLE');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_ASSESSMENT_DECLINED'), true);
+});
+
+test('command-runner process failure observed during sandbox help confirms helper resolution only', () => {
+  const summary = summarizeAssessment(
+    standaloneInventoryWithSandboxHelp('codex-command-runner.exe CreateProcessWithLogonW failed: 2'),
+    [],
+    null,
+    { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false }
+  );
+  assert.equal(summary.activeCli.helperResolution, 'CONFIRMED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.sandboxRuntime, 'FAILED – PROCESS CREATION FAILED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'COMMAND_RUNNER_PROCESS_CREATION_FAILED'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+});
+
+test('generic elevation failure observed during sandbox help leaves helper resolution untested', () => {
+  const summary = summarizeAssessment(
+    standaloneInventoryWithSandboxHelp('requested operation requires elevation (os error 740)'),
+    [],
+    null,
+    { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false }
+  );
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.sandboxRuntime, 'FAILED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), true);
+});
+
+test('successful sandbox help without smoke leaves helper and runtime untested', () => {
+  const summary = summarizeAssessment(
+    standaloneInventoryWithSandboxHelp(null, 'AVAILABLE'),
+    [],
+    null,
+    { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false }
+  );
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.activeCli.runtimeStartup, 'NOT_TESTED');
+  assert.equal(summary.sandboxRuntime, 'NOT TESTED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+});
+
+test('declined standalone live probes do not claim helper resolution', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: {
+      complete: false,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+    },
+  }, [], null, { assessmentMode: ASSESSMENT_MODES.GUIDED_LIVE_PROBES_SKIPPED, execpolicyRun: true, boundaryAssessmentDeclined: true });
+  assert.equal(summary.sandboxRuntime, 'NOT RUN');
+  assert.equal(summary.activeCli.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION NOT TESTED');
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.recommendations.find((item) => item.code === 'BOUNDARY_ASSESSMENT_DECLINED')?.severity, 'INFO');
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_CLI_BUNDLE_INCOMPLETE'), false);
+  assert.doesNotMatch(summary.nextSteps.join('\n'), /update or reinstall/i);
+  assert.match(summary.nextSteps.join('\n'), /controlled runtime preflight and optional live probes/i);
+});
+
+test('partial standalone resource layout retains the update or reinstall recommendation', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: {
+      complete: false,
+      probeEligible: false,
+      installType: 'standalone',
+      resourceLayout: 'PARTIAL',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: false,
+    },
+  }, [], null, { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false });
+  assert.equal(summary.recommendations.find((item) => item.code === 'ACTIVE_CLI_BUNDLE_INCOMPLETE')?.severity, 'ACTION_RECOMMENDED');
+  assert.match(summary.nextSteps.join('\n'), /update or reinstall/i);
+  assert.match(summary.nextSteps.join('\n'), /standalone package.*complete required resource layout/i);
+});
+
+test('failed active standalone helper keeps the specific diagnostic without a generic incomplete-bundle recommendation', () => {
+  const activeBundle = {
+    complete: false,
+    probeEligible: true,
+    installType: 'standalone',
+    resourceLayout: 'COMPLETE',
+    helperResolution: 'NOT_TESTED',
+    runtimeStartup: 'NOT_TESTED',
+    standaloneResourcesFound: true,
+    standaloneRequiredResourcesPresent: true,
+    resourceVersionMatchesActive: true,
+    standalonePackage: { releaseVersion: '0.146.0' },
+  };
+  const testedBundleMetadata = {
+    installType: 'standalone',
+    complete: false,
+    probeEligible: true,
+    resourceLayout: 'COMPLETE',
+    helperResolution: 'NOT_TESTED',
+    runtimeStartup: 'NOT_TESTED',
+    standaloneResourcesFound: true,
+    standaloneRequiredResourcesPresent: true,
+    resourceVersionMatchesActive: true,
+    releaseVersion: '0.146.0',
+  };
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle,
+    standalonePackages: [],
+    sandboxWindowsState: 'AVAILABLE',
+  }, [], {
+    status: 'SETUP_FAILED',
+    codexSource: 'ACTIVE_CLI',
+    testedCodexVersion: 'codex-cli 0.146.0',
+    testedBundleMetadata,
+    smoke: { passed: false, stderr: 'orchestrator_helper_launch_failed: program not found' },
+    probes: [],
+    runtimeEvidence: buildSandboxRuntimeEvidence('orchestrator_helper_launch_failed: program not found', {
+      step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI',
+    }),
+    error: 'orchestrator_helper_launch_failed: program not found',
+  }, { execpolicyRun: false });
+  assert.equal(summary.activeCli.helperResolution, 'FAILED');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.recommendations.find((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED')?.severity, 'ACTION_RECOMMENDED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_CLI_BUNDLE_INCOMPLETE'), false);
+  assert.equal(summary.nextSteps.filter((item) => /update or reinstall/i.test(item)).length, 0);
+});
+
+test('unclassified elevation setup failure retains the generic setup diagnostic', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: { complete: true, probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+    sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED',
+  }, [], {
+    status: 'SETUP_FAILED',
+    codexSource: 'ACTIVE_CLI',
+    testedCodexVersion: 'codex-cli 0.146.0',
+    smoke: { passed: false, stderr: 'requested operation requires elevation (os error 740)' },
+    probes: [],
+    error: 'requested operation requires elevation (os error 740)',
+  }, { execpolicyRun: false });
+  assert.equal(summary.recommendations.find((item) => item.code === 'SANDBOX_SETUP_FAILED')?.severity, 'ACTION_RECOMMENDED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'COMMAND_RUNNER_PROCESS_CREATION_FAILED'), false);
+});
+
+test('successful smoke confirms runtime startup but not sandbox boundary pass by itself', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.146.0',
+    config: { warnings: [] },
+    activeBundle: {
+      complete: false,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+    },
+  }, [], { status: 'SMOKE_COMPLETED', codexSource: 'ACTIVE_CLI', smoke: { passed: true }, probes: [] }, { execpolicyRun: false });
+  assert.equal(summary.sandboxRuntime, 'READY');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.activeCli.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION CONFIRMED');
+  assert.equal(summary.activeCli.helperResolution, 'CONFIRMED');
+  assert.equal(summary.activeCli.runtimeStartup, 'READY');
+  assert.equal(summary.recommendations.some((item) => item.code === 'ACTIVE_BUNDLE_BOUNDARY_PASS'), false);
+});
+
+test('ready runtime with incomplete method evidence recommends runner review instead of another availability check', () => {
+  const probes = completeBoundaryProbes();
+  for (const probe of probes) {
+    if (probe.location === 'outside' && ['powershell', 'node'].includes(probe.method)) {
+      probe.assessment = 'TEST_ERROR';
+      probe.errorTargetMatched = false;
+      probe.targetIdentityStatus = 'NOT REPORTED';
+    }
+  }
+  const inventory = {
+    codexVersion: 'codex-cli 0.145.0',
+    config: { warnings: [] },
+    sandboxWindowsState: 'AVAILABLE',
+    activeBundle: {
+      installType: 'standalone', complete: false, probeEligible: true, resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', standaloneResourcesFound: true,
+    },
+  };
+  const sandbox = completedBoundarySandbox({
+    codexSource: 'NEWER_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.146.0-alpha.3.1',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    versionMismatch: true,
+    testedBundleMetadata: { installType: 'standalone', resourceLayout: 'COMPLETE', probeEligible: true },
+    probes,
+  });
+  const summary = summarizeAssessment(inventory, [], sandbox, { execpolicyRun: false });
+  assert.equal(summary.sandboxRuntime, 'READY');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.methodCoverage, '1/3');
+  assert.match(summary.nextSteps.join('\n'), /Review the incomplete method evidence/);
+  assert.doesNotMatch(summary.nextSteps.join('\n'), /When the Windows sandbox state is AVAILABLE/);
+});
+
+test('helper resolution diagnostics require explicit setup-helper missing evidence', () => {
+  assert.equal(detectSandboxHelperResolutionFailure('codex-windows-sandbox-setup.exe failed with os error 740'), false);
+  assert.equal(detectSandboxHelperResolutionFailure('requested operation requires elevation for setup helper'), false);
+  assert.equal(detectSandboxHelperResolutionFailure('access denied while running codex-windows-sandbox-setup.exe'), false);
+  assert.equal(detectSandboxHelperResolutionFailure('program not found: unrelated-helper.exe'), false);
+  assert.equal(detectSandboxHelperResolutionFailure('orchestrator_helper_launch_failed: program not found'), true);
+  assert.equal(detectSandboxHelperResolutionFailure('codex-windows-sandbox-setup.exe ENOENT'), true);
+  assert.equal(detectSandboxHelperResolutionFailure('setup-helper-not-resolved'), true);
+});
+
+test('standalone current symlink or junction is deduplicated with its release target', (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-current-'));
+  const standaloneRoot = path.join(codexHome, 'packages', 'standalone');
+  const release = path.join(standaloneRoot, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(standaloneRoot, 'current');
+  fs.mkdirSync(path.join(release, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(release, 'codex-resources'), { recursive: true });
+  fs.writeFileSync(path.join(release, 'bin', 'codex.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
+  fs.writeFileSync(path.join(release, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
+  try {
+    fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    fs.rmSync(codexHome, { recursive: true, force: true });
+    t.skip(`symlink/junction unavailable: ${error.message}`);
+    return;
+  }
+  const packages = discoverStandalonePackages(codexHome);
+  assert.equal(packages.length, 1);
+  assert.equal(packages[0].releaseVersion, '0.146.0');
+  assert.deepEqual([...packages[0].sources].sort(), ['current', 'release']);
+  assert.equal(packages[0].aliases.length, 1);
+  const currentExecutable = path.join(current, 'bin', 'codex.exe');
+  const bundle = inspectCodexBundle(currentExecutable, {
+    codexHome,
+    activeVersion: 'codex-cli 0.146.0',
+    standalonePackages: packages,
+  });
+  assert.equal(bundle.installType, 'standalone');
+  assert.equal(bundle.standalonePackage.releaseVersion, '0.146.0');
+  assert.equal(bundle.resourceLayout, 'COMPLETE');
+  assert.equal(bundle.probeEligible, true);
+  assert.equal(bundle.helperResolution, 'NOT_TESTED');
+  assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
+  fs.rmSync(codexHome, { recursive: true, force: true });
+});
+
+test('failed alternative standalone smoke reports staged evidence instead of a complete bundle', () => {
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.145.0',
+    config: { warnings: [] },
+    activeBundle: { complete: false, probeEligible: false, resourceLayout: 'MISSING' },
+  }, [], {
+    status: 'SETUP_FAILED',
+    codexSource: 'NEWER_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.146.0',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    versionMismatch: true,
+    testedBundleMetadata: {
+      installType: 'standalone',
+      complete: false,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+      releaseVersion: '0.146.0',
+    },
+    smoke: { passed: false, stderr: 'orchestrator_helper_launch_failed: program not found' },
+    probes: [],
+    runtimeEvidence: buildSandboxRuntimeEvidence('orchestrator_helper_launch_failed: program not found', {
+      step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE',
+    }),
+    error: 'orchestrator_helper_launch_failed: program not found',
+  }, { execpolicyRun: false });
+  assert.equal(summary.testedBundle.resourceLayout, 'COMPLETE');
+  assert.equal(summary.testedBundle.helperResolution, 'FAILED');
+  assert.equal(summary.testedBundle.runtimeStartup, 'FAILED');
+  assert.equal(summary.testedBundle.boundaryStatus, 'TEST ERROR');
+  assert.equal(summary.testedBundle.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION FAILED');
+  assert.notEqual(summary.testedBundle.bundleStatus, 'COMPLETE');
+});
+
+function targetedStandaloneInventory({
+  error = null,
+  sandboxState = error ? 'AVAILABLE_BUT_SETUP_FAILED' : 'AVAILABLE',
+  doctorOk = false,
+} = {}) {
+  return {
+    platform: 'win32',
+    release: 'test-release',
+    nodeVersion: process.version,
+    nodeRuntimeSource: 'TEST',
+    nodeInPath: true,
+    npmInPath: false,
+    elevated: false,
+    codexInstalled: true,
+    codexVersion: 'codex-cli 0.145.0',
+    activeCodexPath: 'C:\\synthetic\\active\\codex.exe',
+    activeBundle: {
+      installType: 'standalone',
+      complete: false,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+      resourceVersionMatchesActive: true,
+      releaseVersion: '0.145.0',
+      missing: [],
+    },
+    standalonePackages: [],
+    sandboxWindowsState: sandboxState,
+    sandboxWindowsAvailable: sandboxState === 'AVAILABLE',
+    sandboxSetupFailed: sandboxState === 'AVAILABLE_BUT_SETUP_FAILED',
+    sandboxHelpError: error,
+    sandboxHelpRuntimeEvidence: error
+      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' })
+      : null,
+    doctor: { status: doctorOk ? 'COMPLETED' : 'NOT_RUN', ok: doctorOk, overallStatus: doctorOk ? 'ok' : null },
+    codexHome: 'C:\\synthetic\\codex-home',
+    authFilePresent: false,
+    config: { exists: false, path: 'C:\\synthetic\\codex-home\\config.toml', warnings: [] },
+    ruleFiles: [],
+    matchingCompleteBundles: [],
+    newerCompleteBundles: [],
+  };
+}
+
+function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, probes = [] } = {}) {
+  return {
+    status,
+    codexSource: 'NEWER_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.146.0',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    versionMismatch: true,
+    testedBundleMetadata: {
+      installType: 'standalone',
+      complete: false,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+      standaloneResourcesFound: true,
+      standaloneRequiredResourcesPresent: true,
+      resourceVersionMatchesActive: true,
+      releaseVersion: '0.146.0',
+    },
+    hostPreflight: { passed: status === 'COMPLETED', filesChecked: status === 'COMPLETED' ? 2 : 0 },
+    hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
+    smoke: status === 'COMPLETED'
+      ? { passed: true, stderr: '' }
+      : { passed: false, stderr: error || '' },
+    runtimeEvidence: error
+      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE' })
+      : null,
+    cleanup: status === 'COMPLETED'
+      ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
+      : { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null },
+    probes,
+    error,
+  };
+}
+
+test('active helper failure remains targeted when an alternative bundle passes its boundary', () => {
+  const inventory = targetedStandaloneInventory({
+    error: 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT',
+    doctorOk: true,
+  });
+  const sandbox = alternativeStandaloneSandbox({
+    probes: completeBoundaryProbes(),
+  });
+  const summary = summarizeAssessment(inventory, [], sandbox, { execpolicyRun: false });
+
+  assert.equal(summary.boundary, 'PASS');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.testedBundle.boundaryStatus, 'PASS');
+  assert.equal(summary.activeRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED' && item.target === 'ACTIVE_CLI'), true);
+  assert.equal(summary.testedRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'ALTERNATIVE_BUNDLE_BOUNDARY_PASS' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED' && item.target === 'ACTIVE_CLI'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED' && item.target === 'ACTIVE_CLI'), true);
+  assert.match(summary.interpretation.join('\n'), /does not validate the active PATH CLI/i);
+  assert.deepEqual(summary.nextSteps, [
+    'The selected alternative executable passed the tested boundary checks. To validate the active PATH CLI, correct its helper-resolution problem and test that executable separately.',
+  ]);
+});
+
+test('bundle statistics deduplicate current and release aliases by executable realpath', (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-report-bundle-alias-'));
+  const releaseDir = path.join(temp, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const releaseBin = path.join(releaseDir, 'bin');
+  const currentDir = path.join(temp, 'current');
+  fs.mkdirSync(releaseBin, { recursive: true });
+  fs.writeFileSync(path.join(releaseBin, 'codex.exe'), 'synthetic');
+  try {
+    fs.symlinkSync(releaseDir, currentDir, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    fs.rmSync(temp, { recursive: true, force: true });
+    t.skip(`symlink/junction unavailable: ${error.message}`);
+    return;
+  }
+  const bundles = [
+    { executablePath: path.join(currentDir, 'bin', 'codex.exe'), version: 'codex-cli 0.146.0' },
+    { executablePath: path.join(releaseBin, 'codex.exe'), version: 'codex-cli 0.146.0' },
+  ];
+  const statistics = summarizeExecutableBundles(bundles);
+  assert.equal(statistics.logicalExecutableCount, 1);
+  assert.equal(statistics.discoveredPathCount, 2);
+  assert.equal(statistics.aliasPathCount, 1);
+  assert.deepEqual(statistics.discoveredPaths.map((value) => path.normalize(value)).sort(), bundles.map((bundle) => path.normalize(bundle.executablePath)).sort());
+  const summary = summarizeAssessment({ config: { warnings: [] }, matchingCompleteBundles: bundles }, [], null, {
+    assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY,
+    execpolicyRun: false,
+  });
+  assert.deepEqual(summary.bundleStatistics.matching, {
+    logicalExecutableCount: 1,
+    discoveredPathCount: 2,
+    aliasPathCount: 1,
+  });
+  fs.rmSync(temp, { recursive: true, force: true });
+});
+
+test('bundle statistics keep distinct same-version executables separate', () => {
+  const bundles = [
+    { executablePath: 'C:\\standalone-a\\bin\\codex.exe', version: 'codex-cli 0.146.0' },
+    { executablePath: 'C:\\standalone-b\\bin\\codex.exe', version: 'codex-cli 0.146.0' },
+  ];
+  const statistics = summarizeExecutableBundles(bundles);
+  assert.equal(statistics.logicalExecutableCount, 2);
+  assert.equal(statistics.discoveredPathCount, 2);
+  assert.equal(statistics.aliasPathCount, 0);
+});
+
+test('active doctor OK is not compared with an alternative bundle runtime failure', () => {
+  const inventory = targetedStandaloneInventory({ doctorOk: true });
+  const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
+  const summary = summarizeAssessment(
+    inventory,
+    [],
+    alternativeStandaloneSandbox({ status: 'SETUP_FAILED', error }),
+    { execpolicyRun: false }
+  );
+
+  assert.equal(summary.activeCli.helperResolution, 'NOT_TESTED');
+  assert.equal(summary.activeCli.runtimeStartup, 'NOT_TESTED');
+  assert.equal(summary.testedBundle.helperResolution, 'CONFIRMED');
+  assert.equal(summary.testedBundle.runtimeStartup, 'FAILED');
+  assert.equal(summary.testedRuntimeDiagnostics.some((item) => item.code === 'COMMAND_RUNNER_PROCESS_CREATION_FAILED' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.runtimeDiagnostics.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED'), false);
+});
+
+test('generic sandbox setup diagnosis is suppressed independently for each target', () => {
+  const inventory = targetedStandaloneInventory({
+    error: 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT',
+  });
+  const error = 'requested operation requires elevation (os error 740)';
+  const summary = summarizeAssessment(
+    inventory,
+    [],
+    alternativeStandaloneSandbox({ status: 'SETUP_FAILED', error }),
+    { execpolicyRun: false }
+  );
+
+  assert.equal(summary.activeRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED' && item.target === 'ACTIVE_CLI'), true);
+  assert.equal(summary.activeRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+  assert.equal(summary.testedRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_FAILED' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.testedRuntimeDiagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), false);
+  assert.equal(summary.recommendations.find((item) => item.code === 'BOUNDARY_NOT_CONFIRMED')?.message, 'The selected sandbox boundary assessment was intended or started, but no fully reliable verdict was produced.');
+});
+
+function matchingAlternativeSandbox({ status = 'COMPLETED', probes = [], error = null } = {}) {
+  return {
+    status,
+    codexSource: 'MATCHING_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.145.0',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    versionMismatch: false,
+    testedBundleMetadata: {
+      installType: 'classic',
+      complete: true,
+      probeEligible: true,
+      resourceLayout: 'COMPLETE',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+    },
+    hostPreflight: { passed: status === 'COMPLETED', filesChecked: status === 'COMPLETED' ? 2 : 0 },
+    hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
+    smoke: status === 'COMPLETED'
+      ? { passed: true, stderr: '' }
+      : { passed: false, stderr: error || '' },
+    cleanup: status === 'COMPLETED'
+      ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
+      : { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null },
+    probes,
+    error,
+  };
+}
+
+function incompleteActiveCliInventory() {
+  return {
+    codexVersion: 'codex-cli 0.145.0',
+    config: { warnings: [] },
+    activeBundle: {
+      installType: 'classic',
+      complete: false,
+      probeEligible: false,
+      resourceLayout: 'MISSING',
+      helperResolution: 'NOT_TESTED',
+      runtimeStartup: 'NOT_TESTED',
+    },
+    standalonePackages: [],
+    sandboxWindowsState: 'AVAILABLE',
+  };
+}
+
+test('same-version matching bundle pass remains alternative evidence', () => {
+  const summary = summarizeAssessment(incompleteActiveCliInventory(), [], matchingAlternativeSandbox({
+    probes: completeBoundaryProbes(),
+  }), { execpolicyRun: false });
+
+  assert.equal(summary.overall, 'ALTERNATIVE BUNDLE BOUNDARY PASSED');
+  assert.equal(summary.isAlternativeExecutable, true);
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.testedBundle.boundaryStatus, 'PASS');
+  assert.equal(summary.testedBundle.versionMismatch, false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'ALTERNATIVE_BUNDLE_BOUNDARY_PASS' && item.target === 'TESTED_BUNDLE'), true);
+  assert.match(summary.testedBundle.scopeNote, /same Codex version.*only to that executable.*does not validate the active PATH CLI/i);
+  assert.equal(summary.interpretation.includes(summary.testedBundle.scopeNote), true);
+});
+
+test('same-version matching bundle test error is targeted to the tested bundle', () => {
+  const error = 'requested operation requires elevation (os error 740)';
+  const summary = summarizeAssessment(
+    incompleteActiveCliInventory(),
+    [],
+    matchingAlternativeSandbox({ status: 'SETUP_FAILED', error }),
+    { execpolicyRun: false }
+  );
+
+  assert.equal(summary.overall, 'ALTERNATIVE BUNDLE TEST ERROR / INCOMPLETE');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED' && item.target === 'ACTIVE_CLI'), false);
+});
+
+test('same-version matching bundle boundary gap is targeted to the tested bundle', () => {
+  const summary = summarizeAssessment(incompleteActiveCliInventory(), [], matchingAlternativeSandbox({
+    probes: completeBoundaryProbes({ gapMethod: 'powershell' }),
+  }), { execpolicyRun: false });
+
+  assert.equal(summary.overall, 'ALTERNATIVE BUNDLE GAP DETECTED');
+  assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP' && item.target === 'ACTIVE_CLI'), false);
 });
