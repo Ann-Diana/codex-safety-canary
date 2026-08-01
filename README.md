@@ -1,4 +1,4 @@
-# Codex Safety Canary for Windows
+# Codex Safety Canary
 
 <p align="center">
   <img src="docs/assets/codex-safety-canary-hero.png" alt="Yellow canary beside a wooden sandbox frame" width="760">
@@ -20,31 +20,39 @@ It uses only disposable synthetic files. It does **not** open, scan, modify, or 
   <img src="docs/screenshots/01-main-menu.png" alt="Codex Safety Canary main menu with guided assessment, configuration review, execpolicy coverage and disposable Windows sandbox test options" width="760">
 </p>
 
-<p>
-  <img src="docs/screenshots/02-sandbox-only-declined.png" alt="Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED" width="49%">
-  <img src="docs/screenshots/03-sandbox-only-report-dialog.png" alt="Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED" width="49%">
-</p>
+### Safe guided assessment
 
 <p>
   <img src="docs/screenshots/04-guided-live-probes-declined.png" alt="Guided assessment completed with live probes declined, reporting PARTIAL / LIVE PROBES DECLINED, sandbox boundary NOT TESTED and runtime pairs NOT TESTED" width="49%">
   <img src="docs/screenshots/05-execpolicy-coverage-test.png" alt="Execpolicy coverage results for PowerShell Remove-Item, the PowerShell 7 wrapper, cmd.exe del, Node.js fs.rmSync, Git clean and Git reset, reported separately from the sandbox boundary" width="49%">
 </p>
 
-<p>
-  <img src="docs/screenshots/06-share-safe-support-report.png" alt="Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review" width="49%">
-  <img src="docs/screenshots/07-share-safe-badge.png" alt="Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing" width="49%">
-</p>
+### Executable selection and bounded evidence
 
 <p>
   <img src="docs/screenshots/08-executable-selection.png" alt="Selection between the active PATH CLI and a separate newer Codex executable, with the sandbox result explicitly limited to the selected executable" width="49%">
   <img src="docs/screenshots/09-alternative-bundle-boundary-pass.png" alt="Separate Codex executable passing PowerShell, cmd.exe and Node.js sandbox boundary probes with complete three-of-three runtime coverage while the active PATH CLI remains NOT TESTED" width="49%">
 </p>
 
+### Sandbox-only decline and detailed report
+
+<p>
+  <img src="docs/screenshots/02-sandbox-only-declined.png" alt="Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED" width="49%">
+  <img src="docs/screenshots/03-sandbox-only-report-dialog.png" alt="Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED" width="49%">
+</p>
+
+### Share-safe support output
+
+<p>
+  <img src="docs/screenshots/06-share-safe-support-report.png" alt="Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review" width="49%">
+  <img src="docs/screenshots/07-share-safe-badge.png" alt="Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing" width="49%">
+</p>
+
 All screenshots contain synthetic or redacted demo data only.
 
 ## Why this exists
 
-Codex security has several layers with different jobs:
+Codex uses several safety and execution-control layers, each with a different role:
 
 - the Windows sandbox controls filesystem and network boundaries;
 - permission and approval settings control when Codex may proceed or must ask;
@@ -127,7 +135,7 @@ It tests three runtime paths in matched pairs:
 - `cmd.exe` deletion inside and outside the workspace;
 - Node.js filesystem deletion inside and outside the workspace.
 
-The current `codex sandbox` developer command is invoked with the built-in `:workspace` permission profile and the disposable workspace is supplied explicitly with `--cd`. A boundary `PASS` requires the complete structured PowerShell, `cmd.exe`, and Node.js matrix (`3/3`): every runtime must delete its inside file and produce target-bound access-denied evidence for its outside file. Successful individual methods inside an incomplete, interrupted, or contradictory matrix do not establish any boundary protection. Such technical evidence is reported as `TEST ERROR / INCOMPLETE`; `NOT TESTED` means that no boundary conclusion was produced. `PARTIAL` describes only an assessment flow that stopped before live probes, such as an explicit decline, and its boundary remains `NOT TESTED`. The run folder is removed after the report is written.
+The current `codex sandbox` developer command is invoked with the built-in `:workspace` permission profile and the disposable workspace is supplied explicitly with `--cd`. A boundary `PASS` requires the complete structured PowerShell, `cmd.exe`, and Node.js matrix (`3/3`): every runtime must delete its inside file and produce target-bound access-denied evidence for its outside file. Successful individual methods inside an incomplete, interrupted, or contradictory matrix do not establish any boundary protection. Such technical evidence is reported as `TEST ERROR / INCOMPLETE`; `NOT TESTED` means that no boundary conclusion was produced. `PARTIAL` describes only an assessment flow that stopped before live probes, such as an explicit decline, and its boundary remains `NOT TESTED`. The run folder is cleaned up before the final reports are written, so the structured cleanup status is included consistently in every report format.
 
 ## Quick start
 
@@ -174,7 +182,9 @@ The support reports intentionally retain diagnostic version, installation, runti
 
 ### `PASS`
 
-A complete runtime pair behaved as expected: its inside-workspace file was deleted and its outside-workspace file remained with access-denied evidence.
+A method-level `PASS` means that one complete runtime pair behaved as expected: its inside-workspace file was deleted and its outside-workspace file remained with target-bound access-denied evidence.
+
+An overall sandbox-boundary `PASS` requires the complete structured PowerShell, `cmd.exe`, and Node.js matrix (`3/3`). Successful individual methods inside an incomplete, interrupted, or contradictory matrix do not establish an overall boundary pass.
 
 ### `CRITICAL_GAP`
 
@@ -223,7 +233,7 @@ Codex Safety Canary is:
 - a local diagnostic;
 - Windows-first;
 - Codex CLI-specific in version 0.1 – it does not yet test the desktop app or IDE extension;
-- safe by construction with synthetic test files;
+- designed to use only disposable synthetic test files;
 - read-only with respect to real projects and Codex credentials.
 
 It is **not**:
@@ -268,9 +278,4 @@ Automated tests cover parsing, valid execpolicy no-match output, safe path clean
 
 ## License
 
-MIT
-
-
-### Boundary-test validity
-
-The live test explicitly selects the built-in `:workspace` permission profile and binds it to the disposable workspace. A full boundary pass is valid only when all matched inside/outside runtime pairs behave correctly. Retained files caused by syntax errors or unrelated command failures are reported as test errors, not passes.
+MIT License. See [LICENSE](LICENSE).

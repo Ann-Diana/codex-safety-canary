@@ -1551,15 +1551,24 @@ test('README references all nine authoritative screenshots exactly once with res
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const screenshots = [
     ['01-main-menu.png', 'Codex Safety Canary main menu with guided assessment, configuration review, execpolicy coverage and disposable Windows sandbox test options'],
-    ['02-sandbox-only-declined.png', 'Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED'],
-    ['03-sandbox-only-report-dialog.png', 'Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED'],
     ['04-guided-live-probes-declined.png', 'Guided assessment completed with live probes declined, reporting PARTIAL / LIVE PROBES DECLINED, sandbox boundary NOT TESTED and runtime pairs NOT TESTED'],
     ['05-execpolicy-coverage-test.png', 'Execpolicy coverage results for PowerShell Remove-Item, the PowerShell 7 wrapper, cmd.exe del, Node.js fs.rmSync, Git clean and Git reset, reported separately from the sandbox boundary'],
-    ['06-share-safe-support-report.png', 'Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review'],
-    ['07-share-safe-badge.png', 'Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing'],
     ['08-executable-selection.png', 'Selection between the active PATH CLI and a separate newer Codex executable, with the sandbox result explicitly limited to the selected executable'],
     ['09-alternative-bundle-boundary-pass.png', 'Separate Codex executable passing PowerShell, cmd.exe and Node.js sandbox boundary probes with complete three-of-three runtime coverage while the active PATH CLI remains NOT TESTED'],
+    ['02-sandbox-only-declined.png', 'Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED'],
+    ['03-sandbox-only-report-dialog.png', 'Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED'],
+    ['06-share-safe-support-report.png', 'Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review'],
+    ['07-share-safe-badge.png', 'Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing'],
   ];
+  const screenshotAlts = Object.fromEntries(screenshots);
+  const screenshotHeadings = [
+    '### Safe guided assessment',
+    '### Executable selection and bounded evidence',
+    '### Sandbox-only decline and detailed report',
+    '### Share-safe support output',
+  ];
+  assert.equal(readme.split(/\r?\n/, 1)[0], '# Codex Safety Canary');
+  assert.equal(readme.includes('Codex security has several layers with different jobs:'), false);
   assert.equal(readme.split('docs/screenshots/').length - 1, screenshots.length);
   for (const [name, alt] of screenshots) {
     const relativePath = `docs/screenshots/${name}`;
@@ -1575,18 +1584,49 @@ test('README references all nine authoritative screenshots exactly once with res
   assert.equal(readme.includes('![]('), false);
   const orderedPositions = screenshots.map(([name]) => readme.indexOf(`docs/screenshots/${name}`));
   assert.deepEqual([...orderedPositions].sort((left, right) => left - right), orderedPositions);
-  assert.equal(screenshots[1][1].includes('NOT TESTED'), true);
-  assert.equal(screenshots[2][1].includes('NOT TESTED'), true);
-  assert.equal(screenshots[3][1].includes('PARTIAL'), true);
-  assert.equal(screenshots[3][1].includes('NOT TESTED'), true);
+  const headingPositions = screenshotHeadings.map((heading) => {
+    assert.equal(readme.split(heading).length - 1, 1, heading);
+    return readme.indexOf(heading);
+  });
+  assert.deepEqual([...headingPositions].sort((left, right) => left - right), headingPositions);
+  const narrativeAnchors = [
+    '01-main-menu.png',
+    screenshotHeadings[0],
+    '04-guided-live-probes-declined.png',
+    '05-execpolicy-coverage-test.png',
+    screenshotHeadings[1],
+    '08-executable-selection.png',
+    '09-alternative-bundle-boundary-pass.png',
+    screenshotHeadings[2],
+    '02-sandbox-only-declined.png',
+    '03-sandbox-only-report-dialog.png',
+    screenshotHeadings[3],
+    '06-share-safe-support-report.png',
+    '07-share-safe-badge.png',
+  ];
+  const narrativePositions = narrativeAnchors.map((anchor) => readme.indexOf(anchor));
+  assert.deepEqual([...narrativePositions].sort((left, right) => left - right), narrativePositions);
+  assert.equal(screenshotAlts['02-sandbox-only-declined.png'].includes('NOT TESTED'), true);
+  assert.equal(screenshotAlts['03-sandbox-only-report-dialog.png'].includes('NOT TESTED'), true);
+  assert.equal(screenshotAlts['04-guided-live-probes-declined.png'].includes('PARTIAL'), true);
+  assert.equal(screenshotAlts['04-guided-live-probes-declined.png'].includes('NOT TESTED'), true);
   for (const commandForm of ['PowerShell Remove-Item', 'PowerShell 7 wrapper', 'cmd.exe del', 'Node.js fs.rmSync', 'Git clean', 'Git reset']) {
-    assert.equal(screenshots[4][1].includes(commandForm), true, commandForm);
+    assert.equal(screenshotAlts['05-execpolicy-coverage-test.png'].includes(commandForm), true, commandForm);
   }
-  assert.equal(screenshots[5][1].includes('removed'), true);
-  assert.equal(screenshots[5][1].includes('retained'), true);
-  assert.match(screenshots[6][1], /review before public sharing/i);
-  assert.match(screenshots[7][1], /limited to the selected executable/i);
-  assert.match(screenshots[8][1], /three-of-three.*active PATH CLI remains NOT TESTED/i);
+  assert.equal(screenshotAlts['06-share-safe-support-report.png'].includes('removed'), true);
+  assert.equal(screenshotAlts['06-share-safe-support-report.png'].includes('retained'), true);
+  assert.match(screenshotAlts['07-share-safe-badge.png'], /review before public sharing/i);
+  assert.match(screenshotAlts['08-executable-selection.png'], /limited to the selected executable/i);
+  assert.match(screenshotAlts['09-alternative-bundle-boundary-pass.png'], /three-of-three.*active PATH CLI remains NOT TESTED/i);
+  assert.doesNotMatch(readme, /safe by construction/i);
+  assert.equal(readme.includes('Boundary-test validity'), false);
+  assert.doesNotMatch(readme, /run folder is removed after the report is written/i);
+  assert.match(readme, /run folder is cleaned up before the final reports are written[^.]*structured cleanup status[^.]*every report format/i);
+  const topLevelHeadings = readme.match(/^## .+$/gm) ?? [];
+  assert.equal(topLevelHeadings.at(-1), '## License');
+  const licenseSection = readme.slice(readme.lastIndexOf('## License'));
+  assert.equal(licenseSection.includes('[LICENSE](LICENSE)'), true);
+  assert.equal(fs.existsSync(new URL('../LICENSE', import.meta.url)), true);
 });
 
 test('all fifteen public PNGs are structurally valid and free of metadata-bearing chunks', () => {

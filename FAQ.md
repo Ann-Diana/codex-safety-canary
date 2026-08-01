@@ -45,7 +45,7 @@ The Windows launcher can use the Node executable bundled inside Codex when `node
 
 The Canary distinguishes two layouts. In a classic layout, the required Windows sandbox helper and command-runner executables sit beside `codex.exe`. In a standalone layout, matching helpers live under the package's `codex-resources` directory instead. A complete standalone resource layout is not reported as an incomplete bundle merely because runtime resolution has not yet been tested; resource presence, helper resolution, runtime startup, and boundary proof remain separate states.
 
-## Is it safe to use a probe-eligible executable found elsewhere?
+## What happens when another probe-eligible executable is found?
 
 The active PATH CLI remains the recommended default. If multiple probe-eligible local executables exist, the Canary shows a numbered choice with each source, version, exact path, resource layout, and sandbox status. A same-version or newer alternative must be selected explicitly, and the selected executable runs a harmless sandbox smoke test before any deletion probe.
 
