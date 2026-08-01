@@ -48,6 +48,8 @@ import {
   buildPowerShellDeleteCommand,
   runHostDeletionPreflight,
   runMethodHostCalibrations,
+  runSandboxProbes,
+  validateStandaloneResourceBinding,
   buildSupportPayload,
   SHARE_SAFE_SHARING_NOTICE,
   formatShareSafeSharingNotice,
@@ -2072,7 +2074,7 @@ test('standalone package discovery records resources separately from classic bun
   fs.rmSync(codexHome, { recursive: true, force: true });
 });
 
-test('active launcher with matching standalone resources is not treated as a proven live-probe bundle', () => {
+test('same-version standalone resources remain neutral inventory for a distinct active launcher', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-launcher-'));
   const codexHome = path.join(root, '.codex');
   const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
@@ -2091,13 +2093,14 @@ test('active launcher with matching standalone resources is not treated as a pro
   const packages = discoverStandalonePackages(codexHome);
   const bundle = inspectCodexBundle(activeLauncher, { codexHome, activeVersion: 'codex-cli 0.146.0', standalonePackages: packages });
   assert.equal(bundle.complete, false);
-  assert.equal(bundle.installType, 'standalone');
-  assert.equal(bundle.standaloneResourcesFound, true);
-  assert.equal(bundle.resourceLayout, 'COMPLETE');
+  assert.equal(bundle.installType, 'classic');
+  assert.equal(bundle.standaloneResourcesFound, false);
+  assert.equal(bundle.resourceLayout, 'MISSING');
   assert.equal(bundle.helperResolution, 'NOT_TESTED');
   assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
   assert.equal(bundle.helperResolutionProven, false);
-  assert.equal(bundle.resourceVersionMatchesActive, true);
+  assert.equal(bundle.resourceVersionMatchesActive, null);
+  assert.equal(bundle.standaloneResourceBinding, null);
 
   const diagnostics = buildRuntimeDiagnostics({
     activeBundle: bundle,
@@ -2108,8 +2111,8 @@ test('active launcher with matching standalone resources is not treated as a pro
       { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' }
     ),
   }, null);
-  assert.equal(diagnostics.find((item) => item.code === 'STANDALONE_RESOURCES_FOUND')?.severity, 'INFO');
-  assert.equal(diagnostics.find((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED')?.severity, 'ACTION_RECOMMENDED');
+  assert.equal(diagnostics.some((item) => item.code === 'STANDALONE_RESOURCES_FOUND'), false);
+  assert.equal(diagnostics.some((item) => item.code === 'SANDBOX_SETUP_HELPER_NOT_RESOLVED'), false);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -2642,6 +2645,239 @@ function createSyntheticStandalonePackage(directory, executableContent = 'synthe
   fs.writeFileSync(path.join(directory, 'codex-resources', 'codex-windows-sandbox-setup.exe'), 'synthetic');
   fs.writeFileSync(path.join(directory, 'codex-resources', 'codex-command-runner.exe'), 'synthetic');
 }
+
+test('foreign executable inside a standalone release tree cannot inherit package resources', (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-foreign-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release, 'canonical executable');
+  const canonicalExecutable = path.join(release, 'bin', 'codex.exe');
+  const foreignExecutable = path.join(release, 'tools', 'codex.exe');
+  fs.mkdirSync(path.dirname(foreignExecutable), { recursive: true });
+  fs.writeFileSync(foreignExecutable, 'foreign executable');
+
+  const relativePath = path.relative(release, foreignExecutable);
+  assert.equal(relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath), false);
+  assert.notEqual(canonicalExistingPathKey(foreignExecutable), canonicalExistingPathKey(canonicalExecutable));
+
+  const bundle = inspectCodexBundle(foreignExecutable, {
+    activeVersion: 'codex-cli 0.146.0',
+    standalonePackages: discoverStandalonePackages(codexHome),
+  });
+  assert.equal(bundle.standaloneResourcesFound, false);
+  assert.equal(bundle.resourceLayout, 'MISSING');
+  assert.equal(bundle.probeEligible, false);
+
+  const plan = selectCodexProbePlan({
+    activeCodexPath: foreignExecutable,
+    codexVersion: 'codex-cli 0.146.0',
+    activeBundle: bundle,
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'AVAILABLE',
+    matchingCompleteBundles: [],
+    newerCompleteBundles: [],
+    completeBundles: [],
+  });
+  assert.equal(plan.ready, false);
+  assert.equal(plan.candidates.length, 0);
+});
+
+test('nested and quoted-path foreign executables remain detached from standalone resources', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "canary O'Brien standalone "));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const release = path.join(root, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release, 'canonical executable');
+  const packages = discoverStandalonePackages(root);
+  const foreignExecutables = [
+    path.join(release, 'bin', 'foreign', 'codex.exe'),
+    path.join(release, 'tools', "Client's Tools", 'codex.exe'),
+    path.join(root, 'outside release', 'codex.exe'),
+  ];
+  for (const foreignExecutable of foreignExecutables) {
+    fs.mkdirSync(path.dirname(foreignExecutable), { recursive: true });
+    fs.writeFileSync(foreignExecutable, 'foreign executable');
+    const bundle = inspectCodexBundle(foreignExecutable, {
+      activeVersion: 'codex-cli 0.146.0',
+      standalonePackages: packages,
+    });
+    assert.equal(bundle.standaloneResourcesFound, false, foreignExecutable);
+    assert.equal(bundle.standaloneRequiredResourcesPresent, false, foreignExecutable);
+    assert.equal(bundle.resourceLayout, 'MISSING', foreignExecutable);
+    assert.equal(bundle.probeEligible, false, foreignExecutable);
+    assert.equal(bundle.standaloneResourceBinding, null, foreignExecutable);
+  }
+});
+
+test('canonical standalone executable and a real file alias retain resource eligibility', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "canary O'Brien canonical "));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const release = path.join(root, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release, 'canonical executable');
+  const canonicalExecutable = path.join(release, 'bin', 'codex.exe');
+  const aliasExecutable = path.join(release, 'tools', 'codex-alias.exe');
+  fs.mkdirSync(path.dirname(aliasExecutable), { recursive: true });
+  fs.linkSync(canonicalExecutable, aliasExecutable);
+  const packages = discoverStandalonePackages(root);
+
+  for (const executable of [canonicalExecutable, aliasExecutable]) {
+    const bundle = inspectCodexBundle(executable, {
+      activeVersion: 'codex-cli 0.146.0',
+      standalonePackages: packages,
+    });
+    assert.equal(bundle.standaloneResourcesFound, true);
+    assert.equal(bundle.resourceLayout, 'COMPLETE');
+    assert.equal(bundle.probeEligible, true);
+    assert.equal(validateStandaloneResourceBinding(bundle.standaloneResourceBinding, executable).valid, true);
+  }
+});
+
+test('probe plan binds current alias to the canonical standalone executable identity', (t) => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-plan-binding-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(codexHome, 'packages', 'standalone', 'current');
+  createSyntheticStandalonePackage(release);
+  fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+  const currentExecutable = path.join(current, 'bin', 'codex.exe');
+  const bundle = inspectCodexBundle(currentExecutable, {
+    activeVersion: 'codex-cli 0.146.0',
+    standalonePackages: discoverStandalonePackages(codexHome),
+  });
+  const plan = selectCodexProbePlan({
+    activeCodexPath: currentExecutable,
+    codexVersion: 'codex-cli 0.146.0',
+    activeBundle: bundle,
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'AVAILABLE',
+    sandboxFullAutoAvailable: true,
+    matchingCompleteBundles: [],
+    newerCompleteBundles: [],
+    completeBundles: [],
+  });
+  assert.equal(plan.ready, true);
+  assert.equal(plan.source, 'ACTIVE_CLI');
+  assert.equal(validateStandaloneResourceBinding(plan.standaloneResourceBinding, plan.codexExe).valid, true);
+});
+
+test('standalone executable identity change before execution fails closed without runtime evidence', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-revalidate-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const release = path.join(root, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release, 'original executable');
+  const executable = path.join(release, 'bin', 'codex.exe');
+  const bundle = inspectCodexBundle(executable, {
+    activeVersion: 'codex-cli 0.146.0',
+    standalonePackages: discoverStandalonePackages(root),
+  });
+  const plan = selectCodexProbePlan({
+    activeCodexPath: executable,
+    codexVersion: 'codex-cli 0.146.0',
+    activeBundle: bundle,
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'AVAILABLE',
+    matchingCompleteBundles: [],
+    newerCompleteBundles: [],
+    completeBundles: [],
+  });
+  const originalExecutable = path.join(release, 'bin', 'codex-original.exe');
+  fs.renameSync(executable, originalExecutable);
+  fs.writeFileSync(executable, 'replacement executable');
+
+  const sandbox = runSandboxProbes({
+    appRoot: path.join(root, 'app'),
+    sandboxWindowsState: plan.sandboxState,
+    codexExe: plan.codexExe,
+    codexSource: plan.source,
+    testedCodexVersion: plan.testedVersion,
+    activeCodexVersion: plan.activeVersion,
+    isAlternativeExecutable: plan.isAlternativeExecutable,
+    versionMismatch: plan.versionMismatch,
+    testedBundleMetadata: plan.testedBundleMetadata,
+    standaloneResourceBinding: plan.standaloneResourceBinding,
+  });
+  assert.equal(sandbox.status, 'SETUP_FAILED');
+  assert.equal(sandbox.setupFailureCode, 'EXECUTABLE_IDENTITY_MISMATCH');
+  assert.equal(sandbox.resourceBindingStatus, 'FAILED');
+  assert.deepEqual(sandbox.probes, []);
+  assert.equal(sandbox.layout, undefined);
+  assert.equal(sandbox.runtimeEvidence, undefined);
+  assert.equal(fs.existsSync(path.join(root, 'app', 'runs')), false);
+
+  const inventory = {
+    platform: 'win32', release: 'synthetic', nodeVersion: process.version,
+    codexInstalled: true, codexVersion: 'codex-cli 0.146.0', activeCodexPath: executable,
+    activeBundle: bundle, standalonePackages: discoverStandalonePackages(root),
+    completeBundles: [], matchingCompleteBundles: [], newerCompleteBundles: [],
+    doctor: { status: 'NOT_RUN', ok: false }, config: { warnings: [] }, ruleFiles: [],
+    sandboxWindowsState: 'AVAILABLE',
+  };
+  const summary = summarizeAssessment(inventory, [], sandbox, { assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
+
+  const report = writeReport({ inventory, rules: [], sandbox, appRoot: path.join(root, 'report-app'), assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  const supportText = fs.readFileSync(report.supportTxtPath, 'utf8');
+  const supportJson = fs.readFileSync(report.supportJsonPath, 'utf8');
+  for (const output of [supportText, supportJson]) {
+    assert.match(output, /EXECUTABLE_IDENTITY_MISMATCH/);
+    assert.doesNotMatch(output, /expectedObjectIdentity|fs:\d|codex-original|replacement executable/);
+    assert.equal(output.includes(root), false);
+  }
+});
+
+test('alternative standalone identity mismatch remains targeted to the tested bundle', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-alternative-revalidate-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const release = path.join(root, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release, 'alternative executable');
+  const executable = path.join(release, 'bin', 'codex.exe');
+  const testedBundle = inspectCodexBundle(executable, {
+    standalonePackages: discoverStandalonePackages(root),
+  });
+  const inventory = {
+    codexVersion: 'codex-cli 0.146.0',
+    activeCodexPath: path.join(root, 'active', 'codex.exe'),
+    activeBundle: { complete: false, probeEligible: false, installType: 'classic', resourceLayout: 'MISSING' },
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED',
+    completeBundles: [],
+    matchingCompleteBundles: [{
+      ...testedBundle,
+      executablePath: executable,
+      version: 'codex-cli 0.146.0',
+      sandboxState: 'AVAILABLE',
+      sandboxFullAutoAvailable: true,
+    }],
+    newerCompleteBundles: [],
+    doctor: { status: 'COMPLETED', ok: true },
+    config: { warnings: [] },
+    ruleFiles: [],
+  };
+  const plan = selectCodexProbePlan(inventory);
+  assert.equal(plan.source, 'MATCHING_COMPLETE_BUNDLE');
+  assert.equal(plan.isAlternativeExecutable, true);
+  const originalExecutable = path.join(release, 'bin', 'codex-original.exe');
+  fs.renameSync(executable, originalExecutable);
+  fs.writeFileSync(executable, 'replacement executable');
+
+  const sandbox = runSandboxProbes({
+    sandboxWindowsState: plan.sandboxState,
+    codexExe: plan.codexExe,
+    codexSource: plan.source,
+    testedCodexVersion: plan.testedVersion,
+    activeCodexVersion: plan.activeVersion,
+    isAlternativeExecutable: plan.isAlternativeExecutable,
+    versionMismatch: plan.versionMismatch,
+    testedBundleMetadata: plan.testedBundleMetadata,
+    standaloneResourceBinding: plan.standaloneResourceBinding,
+  });
+  const summary = summarizeAssessment(inventory, [], sandbox, { assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH' && item.target === 'ACTIVE_CLI'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED' && item.target === 'TESTED_BUNDLE'), false);
+  assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED' && item.target === 'TESTED_BUNDLE'), false);
+});
 
 function diagnosticPathKey(value) {
   if (process.platform === 'win32') return canonicalizeWindowsPath(value).toLowerCase();

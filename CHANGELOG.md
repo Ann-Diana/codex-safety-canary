@@ -21,6 +21,9 @@
 
 ### Security
 
+- Attributes standalone package resources only to executables whose filesystem-object identity matches the canonical package executable.
+- Prevents executables that merely reside below the same release directory from inheriting package resources or probe eligibility.
+- Revalidates the bound executable identity fail-closed immediately before package-backed sandbox probes start.
 - Requires successful host preflight, successful per-method host calibration, smoke startup, clean completion, and an exact PowerShell, cmd.exe, and Node.js runtime matrix (`3/3`) before any boundary PASS; missing, contradictory, ambiguous, or incomplete evidence fails closed.
 - Binds denial evidence to command start, attempted operation, independently reported target identity, before/after file state, error class, HResult, and native Windows error code instead of accepting generic access-denied text.
 - Uses `System.IO.File.Delete` for the PowerShell boundary probe and accepts an outside denial only with a matching `System.UnauthorizedAccessException`, native Win32 error code `5`, or target-bound `PermissionDenied`; `InvalidArgument`, generic ErrorRecords, and message-only access-denied text cannot produce PASS.

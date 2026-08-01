@@ -74,6 +74,7 @@ function makeInventory(scenario, appRoot) {
     runtimeStartup: 'NOT_TESTED',
     missing: [],
     executablePath: matchingCodexPath,
+    standaloneResourceBinding: { expectedObjectIdentity: 'synthetic-matching-object' },
     version: 'codex-cli 0.1.0-alpha.8',
     sandboxState: 'AVAILABLE',
     sandboxFullAutoAvailable: true,
@@ -455,6 +456,7 @@ test('CLI Guided Assessment lets the user select a same-version alternative expl
   assert.match(stdout, /\[2\] Separate same-version standalone executable/);
   assert.match(stdout, /This result applies only to the selected executable and does not validate the active PATH CLI/);
   assert.equal(sandboxOptions.codexSource, 'MATCHING_COMPLETE_BUNDLE');
+  assert.equal(sandboxOptions.standaloneResourceBinding.expectedObjectIdentity, 'synthetic-matching-object');
   assert.equal(sandboxOptions.isAlternativeExecutable, true);
   assert.equal(sandboxOptions.versionMismatch, false);
   assert.match(sandboxOptions.scopeNote, /same Codex version/);
