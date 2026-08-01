@@ -13,6 +13,7 @@
 - Separates resource layout, helper resolution, runtime startup, and boundary proof so file presence is never reported as runtime or protection evidence and complete but untested standalone resources do not trigger an unnecessary reinstall recommendation.
 - Resolves launcher, standalone `current`, and release paths through realpaths, deduplicates aliases, preserves their source metadata, and derives the package version from the real release target.
 - Keys complete standalone packages by stat-backed executable object identity, with realpath and canonical-path fallbacks, so Windows junction and directory-symlink aliases merge while independent copies remain separate.
+- Derives standalone aliases from normalized visible discovery paths, preserving `current` while excluding the representative direct release path consistently across Windows Node.js 18, 20, and 22.
 - Runs the complete operating-system and Node.js CI matrix without fail-fast cancellation so every supported combination reports its result.
 - Keeps the active PATH CLI and every separately selected executable as independent diagnostic targets across console, TXT, JSON, and share-safe reports; same-version and newer alternative results apply only to the selected executable.
 - Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result; `codex doctor --json` remains non-blocking read-only evidence.

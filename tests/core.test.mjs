@@ -38,6 +38,7 @@ import {
   summarizeAssessment,
   summarizeExecutableBundles,
   canonicalExistingPathKey,
+  normalizeDiscoveryPathForComparison,
   resolveFilesystemIdentity,
   detectAccessDenied,
   canonicalizeWindowsPath,
@@ -2306,7 +2307,7 @@ test('share-safe payload redacts standalone paths and nested sandbox diagnostics
           files: { setupHelper: `${releaseDir}\\codex-resources\\codex-windows-sandbox-setup.exe` },
         },
       },
-      standalonePackages: [{ source: 'release', releaseVersion: '0.146.0', resourcesFound: true, codexPathFound: true, requiredResourcesPresent: true, requiredResourcesMissing: [], optionalResourcesMissing: [] }],
+      standalonePackages: [{ source: 'release', releaseVersion: '0.146.0', resourcesFound: true, codexPathFound: true, aliases: [`${codexHome}\\packages\\standalone\\current`], requiredResourcesPresent: true, requiredResourcesMissing: [], optionalResourcesMissing: [] }],
       doctor: { status: 'COMPLETED', ok: true, overallStatus: 'ok', error: `${releaseDir}\\codex-resources\\codex-windows-sandbox-setup.exe` },
       matchingCompleteBundles: [], newerCompleteBundles: [], ruleFiles: [`${codexHome}\\rules\\danger.rules`],
       config: { exists: true, path: `${codexHome}\\config.toml`, warnings: [] },
@@ -2317,6 +2318,7 @@ test('share-safe payload redacts standalone paths and nested sandbox diagnostics
   };
   const payload = buildSupportPayload(report, { CODEX_HOME: codexHome, LOCALAPPDATA: `${userRoot}\\AppData\\Local`, APPDATA: `${userRoot}\\AppData\\Roaming` });
   const serialized = JSON.stringify(payload);
+  assert.equal(payload.environment.standalonePackages[0].aliasCount, 1);
   assert.doesNotMatch(serialized, /Alice/);
   assert.doesNotMatch(serialized, /C:\\Users/i);
   assert.doesNotMatch(serialized, /AppData/i);
@@ -2686,7 +2688,18 @@ function compactLink(filePath, releasePath) {
   }
 }
 
-function standaloneLinkFailureDiagnostic(current, release, packages) {
+function relativeDiagnosticPath(value, root) {
+  const relativePath = path.relative(root, value);
+  if (!relativePath) return '.';
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) return `<outside-root>/${path.basename(value)}`;
+  return relativePath.split(path.sep).join('/');
+}
+
+function standaloneLinkFailureDiagnostic(current, release, packages, discoveries = [
+  { source: 'current', dir: current },
+  { source: 'release', dir: release },
+]) {
+  const standaloneRoot = path.dirname(current);
   const currentExecutable = path.join(current, 'bin', 'codex.exe');
   const releaseExecutable = path.join(release, 'bin', 'codex.exe');
   return JSON.stringify({
@@ -2697,8 +2710,15 @@ function standaloneLinkFailureDiagnostic(current, release, packages) {
     currentExecutableIdentity: compactIdentity(currentExecutable),
     releaseExecutableIdentity: compactIdentity(releaseExecutable),
     packageCount: packages.length,
+    discoveries: discoveries.map((discovery) => ({
+      source: discovery.source,
+      path: relativeDiagnosticPath(discovery.dir, standaloneRoot),
+      normalizedPath: relativeDiagnosticPath(normalizeDiscoveryPathForComparison(discovery.dir), normalizeDiscoveryPathForComparison(standaloneRoot)),
+    })),
     packages: packages.map((standalonePackage) => ({
       sources: standalonePackage.sources,
+      releaseDir: relativeDiagnosticPath(standalonePackage.releaseDir, standaloneRoot),
+      aliases: standalonePackage.aliases.map((alias) => relativeDiagnosticPath(alias, standaloneRoot)),
       aliasCount: standalonePackage.aliases.length,
     })),
   });
@@ -2724,7 +2744,8 @@ test('standalone current symlink or junction is deduplicated with its release ta
   assert.equal(packages.length, 1, diagnostic);
   assert.equal(packages[0].releaseVersion, '0.146.0');
   assert.deepEqual([...packages[0].sources].sort(), ['current', 'release']);
-  assert.equal(packages[0].aliases.length, 1);
+  assert.equal(diagnosticPathKey(packages[0].releaseDir), diagnosticPathKey(release), diagnostic);
+  assert.deepEqual(packages[0].aliases.map(diagnosticPathKey), [diagnosticPathKey(current)], diagnostic);
   const bundle = inspectCodexBundle(currentExecutable, {
     codexHome,
     activeVersion: 'codex-cli 0.146.0',
@@ -2736,6 +2757,19 @@ test('standalone current symlink or junction is deduplicated with its release ta
   assert.equal(bundle.probeEligible, true);
   assert.equal(bundle.helperResolution, 'NOT_TESTED');
   assert.equal(bundle.runtimeStartup, 'NOT_TESTED');
+  const releaseBundle = inspectCodexBundle(path.join(release, 'bin', 'codex.exe'), {
+    codexHome,
+    activeVersion: 'codex-cli 0.146.0',
+    standalonePackages: packages,
+  });
+  assert.equal(
+    diagnosticPathKey(releaseBundle.standalonePackage.releaseDir),
+    diagnosticPathKey(bundle.standalonePackage.releaseDir),
+  );
+  assert.equal(
+    canonicalExistingPathKey(releaseBundle.standalonePackage.executablePath),
+    canonicalExistingPathKey(bundle.standalonePackage.executablePath),
+  );
   fs.rmSync(codexHome, { recursive: true, force: true });
 });
 
@@ -2747,9 +2781,11 @@ test('standalone directory symlink resolves to one release package', () => {
   createSyntheticStandalonePackage(release);
   fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
   const packages = discoverStandalonePackages(codexHome);
-  assert.equal(packages.length, 1, standaloneLinkFailureDiagnostic(current, release, packages));
+  const diagnostic = standaloneLinkFailureDiagnostic(current, release, packages);
+  assert.equal(packages.length, 1, diagnostic);
   assert.deepEqual([...packages[0].sources].sort(), ['current', 'release']);
-  assert.equal(packages[0].aliases.length, 1);
+  assert.equal(diagnosticPathKey(packages[0].releaseDir), diagnosticPathKey(release), diagnostic);
+  assert.deepEqual(packages[0].aliases.map(diagnosticPathKey), [diagnosticPathKey(current)], diagnostic);
   fs.rmSync(codexHome, { recursive: true, force: true });
 });
 
@@ -2795,6 +2831,72 @@ test('standalone package merging is independent of candidate order', () => {
     normalizeResult(deduplicateStandalonePackageCandidates(candidates)),
     normalizeResult(deduplicateStandalonePackageCandidates([...candidates].reverse())),
   );
+  const merged = deduplicateStandalonePackageCandidates(candidates);
+  assert.equal(diagnosticPathKey(merged[0].releaseDir), diagnosticPathKey(release));
+  assert.deepEqual(merged[0].aliases.map(diagnosticPathKey), [diagnosticPathKey(current)]);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('Windows discovery path comparison collapses namespace case slash and separator variants', () => {
+  const direct = 'C:\\Users\\Runner\\.codex\\packages\\standalone\\releases\\0.146.0-x86_64-pc-windows-msvc';
+  const variants = [
+    `\\\\?\\${direct}`,
+    direct.toUpperCase(),
+    direct.replaceAll('\\\\', '/'),
+    'C:\\Users\\Runner\\.codex\\packages\\standalone\\releases\\\\0.146.0-x86_64-pc-windows-msvc',
+  ];
+  const expected = normalizeDiscoveryPathForComparison(direct, 'win32');
+  for (const variant of variants) {
+    assert.equal(normalizeDiscoveryPathForComparison(variant, 'win32'), expected);
+  }
+  assert.equal(
+    normalizeDiscoveryPathForComparison('\\\\?\\UNC\\server\\share\\standalone\\current', 'win32'),
+    normalizeDiscoveryPathForComparison('\\\\server\\share\\standalone\\current', 'win32'),
+  );
+});
+
+test('duplicate current discovery paths produce one visible alias', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-duplicate-alias-'));
+  const release = path.join(root, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(root, 'current');
+  createSyntheticStandalonePackage(release);
+  fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+  const candidates = [
+    { dir: current, source: 'current' },
+    { dir: current, source: 'current' },
+    { dir: release, source: 'release' },
+  ];
+  const packages = deduplicateStandalonePackageCandidates(candidates);
+  const diagnostic = standaloneLinkFailureDiagnostic(current, release, packages, candidates);
+  assert.equal(packages.length, 1, diagnostic);
+  assert.deepEqual(packages[0].sources, ['current', 'release'], diagnostic);
+  assert.deepEqual(packages[0].aliases.map(diagnosticPathKey), [diagnosticPathKey(current)], diagnostic);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('distinct visible discovery paths remain separate aliases of one package', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-multiple-aliases-'));
+  const release = path.join(root, 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const current = path.join(root, 'current');
+  const preview = path.join(root, 'preview');
+  createSyntheticStandalonePackage(release);
+  fs.symlinkSync(release, current, process.platform === 'win32' ? 'junction' : 'dir');
+  fs.symlinkSync(release, preview, process.platform === 'win32' ? 'junction' : 'dir');
+  const candidates = [
+    { dir: preview, source: 'current' },
+    { dir: release, source: 'release' },
+    { dir: current, source: 'current' },
+  ];
+  const packages = deduplicateStandalonePackageCandidates(candidates);
+  const diagnostic = standaloneLinkFailureDiagnostic(current, release, packages, candidates);
+  assert.equal(packages.length, 1, diagnostic);
+  assert.equal(diagnosticPathKey(packages[0].releaseDir), diagnosticPathKey(release), diagnostic);
+  assert.deepEqual(
+    packages[0].aliases.map(diagnosticPathKey).sort(),
+    [current, preview].map(diagnosticPathKey).sort(),
+    diagnostic,
+  );
+  assert.equal(packages[0].aliases.some((alias) => diagnosticPathKey(alias) === diagnosticPathKey(release)), false, diagnostic);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
