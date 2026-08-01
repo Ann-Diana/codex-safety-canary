@@ -36,16 +36,20 @@ Not in the alpha. The disposable workspace is intentionally not a trusted real p
 
 The current Codex CLI legitimately returns `{"matchedRules":[]}` when no loaded rule matches the tested command. This is not a parser failure. It means the user-level rule files did not provide restrictive coverage for that exact command shape. Sandbox enforcement remains a separate layer.
 
-## Why does the Canary mention a bundled Node runtime?
+## Why does the Canary mention a Codex desktop runtime?
 
-The Windows launcher can use the Node executable bundled inside Codex when `node` is not installed in `PATH`. That is sufficient to run the Canary, but it does not imply that `npm` or a normal system-wide Node.js installation is available.
+The Canary itself runs on Node.js. The Windows launcher normally uses Node.js from `PATH`. If that is unavailable, it can use a compatible `node.exe` from a recognized Codex desktop runtime cache when such a cache is present and executable.
+
+This fallback belongs to the Codex desktop runtime environment; it does not mean that the native Codex CLI generally requires or bundles Node.js. It also does not imply that `npm` or a system-wide Node.js installation is available.
+
+Node.js 22 or 24 is recommended. Node.js 18, 20, and 22 are tested compatibility targets for this alpha, but Node.js 18 and 20 are end-of-life.
 
 
 ## Why does the Canary say that the active CLI bundle is incomplete?
 
 The Canary distinguishes two layouts. In a classic layout, the required Windows sandbox helper and command-runner executables sit beside `codex.exe`. In a standalone layout, matching helpers live under the package's `codex-resources` directory instead. A complete standalone resource layout is not reported as an incomplete bundle merely because runtime resolution has not yet been tested; resource presence, helper resolution, runtime startup, and boundary proof remain separate states.
 
-## Is it safe to use a probe-eligible executable found elsewhere?
+## What happens when another probe-eligible executable is found?
 
 The active PATH CLI remains the recommended default. If multiple probe-eligible local executables exist, the Canary shows a numbered choice with each source, version, exact path, resource layout, and sandbox status. A same-version or newer alternative must be selected explicitly, and the selected executable runs a harmless sandbox smoke test before any deletion probe.
 

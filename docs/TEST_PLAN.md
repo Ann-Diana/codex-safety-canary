@@ -21,11 +21,12 @@ Run the launcher as a normal user.
 1. Choose option 4.
 2. Read the displayed data path.
 3. Confirm with `Y`.
-4. Expected result:
+4. Expected result for a correctly protected reference configuration:
    - inside-workspace deletion: `EXPECTED`;
    - all outside-workspace deletion probes: `PASS`.
-5. Confirm that the text report opens.
-6. Confirm that no real project path appears in the report.
+5. Treat `CRITICAL_GAP`, `TEST ERROR / INCOMPLETE`, and `NOT TESTED` as diagnostic outcomes that remain possible when the tested configuration or evidence does not support `PASS`.
+6. Confirm that the text report opens.
+7. Confirm that no real project path appears in the report.
 
 ## Test 4 – Elevated launch
 
@@ -105,6 +106,7 @@ Use only synthetic or already-observed evidence. Do not copy helpers, modify `PA
 26. Confirm the explicit README screenshot/alt-text matrix contains all nine authoritative images exactly once, excludes the collage, and preserves the documented result semantics.
 27. Confirm all 15 public PNGs have valid signatures, CRCs and terminal `IEND`, no trailing bytes, and no text, EXIF, XMP, ICC, C2PA/JUMBF, credential, username, or local-path metadata.
 28. Confirm sandbox-only writes all four reports and opens the standard report dialog when inventory evidence makes live probes unavailable, without reporting a user decline.
+
 ## Boundary validity checks
 
 - Confirm the live command explicitly requests the `:workspace` permission profile.

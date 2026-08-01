@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-alpha.11 – 2026-07-31
+## 0.1.0-alpha.11 – 2026-08-01
 
 ### Added
 
@@ -166,7 +166,7 @@
 - Treat the documented `{"matchedRules":[]}` execpolicy response as a valid `NO_MATCH` result instead of `UNKNOWN_SCHEMA`.
 - Treat a successful sandbox-help exit as availability rather than matching brittle wording in the help text.
 - Use `--full-auto` for disposable sandbox probes when the installed CLI advertises that option.
-- Distinguish a normal Node.js installation from the bundled Codex runtime and report whether `node` and `npm` are available through `PATH`.
+- Distinguish a normal Node.js installation from the optional Codex desktop runtime-cache fallback and report whether `node` and `npm` are available through `PATH`.
 
 ## 0.1.0-alpha.1
 
