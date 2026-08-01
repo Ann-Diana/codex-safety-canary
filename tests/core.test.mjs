@@ -1547,6 +1547,34 @@ test('public documentation avoids absolute share-safe guarantees', () => {
   }
 });
 
+test('public documentation distinguishes Canary Node requirements from Codex CLI requirements', () => {
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const faq = fs.readFileSync(new URL('../FAQ.md', import.meta.url), 'utf8');
+  const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const workflow = fs.readFileSync(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8');
+
+  assert.doesNotMatch(readme, /compatible Node runtime bundled by Codex|Codex CLI[^.\n]*(?:requires|bundles)[^.\n]*Node\.js/i);
+  assert.match(readme, /Requirements to start the Canary:/);
+  assert.match(readme, /Node\.js 18 or newer in `PATH`[^.]*recognized Codex desktop runtime cache/is);
+  assert.match(readme, /Node\.js 22 or 24 is recommended/i);
+  assert.match(readme, /Node\.js 18 and 20[^.]*end-of-life/i);
+  assert.match(readme, /For the full Codex assessment[^.]*working Codex CLI callable as `codex` is\s+required/is);
+  assert.match(readme, /alternative local executables[^.]*never selects one silently/is);
+
+  assert.doesNotMatch(faq, /Why does the Canary mention a bundled Node runtime\?|Node executable bundled inside Codex/i);
+  assert.match(faq, /Why does the Canary mention a Codex desktop runtime\?/i);
+  assert.match(faq, /Canary itself runs on Node\.js/i);
+  assert.match(faq, /normally uses Node\.js from `PATH`/i);
+  assert.match(faq, /recognized Codex desktop runtime cache[^.]*present and executable/is);
+  assert.match(faq, /does not mean that the native Codex CLI generally requires or bundles Node\.js/i);
+  assert.match(faq, /does not imply that `npm` or a system-wide Node\.js installation is available/i);
+  assert.match(faq, /Node\.js 22 or 24 is recommended/i);
+  assert.match(faq, /Node\.js 18 and 20 are end-of-life/i);
+
+  assert.equal(packageJson.engines.node, '>=18');
+  assert.match(workflow, /node-version:\s*\[18, 20, 22\]/);
+});
+
 test('README references all nine authoritative screenshots exactly once with result-oriented alt text', () => {
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const screenshots = [

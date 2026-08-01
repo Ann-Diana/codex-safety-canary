@@ -139,11 +139,19 @@ The current `codex sandbox` developer command is invoked with the built-in `:wor
 
 ## Quick start
 
-Requirements:
+Requirements to start the Canary:
 
 - native Windows;
-- Codex CLI installed and available as `codex`;
-- either Node.js 18 or newer in `PATH`, or the compatible Node runtime bundled by Codex.
+- Node.js 18 or newer in `PATH`, or a compatible Node runtime available in a
+  recognized Codex desktop runtime cache.
+
+Node.js 22 or 24 is recommended. Node.js 18 and 20 remain compatibility
+targets, but both release lines are end-of-life and should not be preferred
+for new installations.
+
+For the full Codex assessment, a working Codex CLI callable as `codex` is
+required. Alpha 11 may additionally list alternative local executables, but it
+never selects one silently.
 
 Then double-click:
 
