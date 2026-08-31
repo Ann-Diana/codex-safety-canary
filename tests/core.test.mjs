@@ -15,6 +15,9 @@ import {
   detectWindowsSandboxFeature,
   deduplicateStandalonePackageCandidates,
   discoverCodexBundlePaths,
+  inventoryAlternativeCodexExecutables,
+  diagnoseExplicitlySelectedCodexExecutable,
+  getCodexInventory,
   discoverStandalonePackages,
   inspectCodexBundle,
   invokeCodex,
@@ -35,6 +38,8 @@ import {
   buildSandboxRuntimeEvidence,
   deriveSandboxRuntimeObservation,
   buildRuntimeDiagnostics,
+  createCodexDoctorInventoryStatus,
+  authFileExists,
   parseCodexDoctorOutput,
   parseStandaloneReleaseVersion,
   summarizeAssessment,
@@ -52,6 +57,7 @@ import {
   runMethodHostCalibrations,
   runSandboxProbes,
   validateStandaloneResourceBinding,
+  validateSelectedExecutableBinding,
   buildSupportPayload,
   SHARE_SAFE_SHARING_NOTICE,
   formatShareSafeSharingNotice,
@@ -71,6 +77,23 @@ const TEST_SANDBOX_COMMAND_CONTRACT = Object.freeze({
 });
 const ACTIVE_EXECUTABLE_IDENTITY = 'synthetic-active-cli-identity';
 const TESTED_EXECUTABLE_IDENTITY = 'synthetic-tested-bundle-identity';
+
+function filesystemAlternative(executablePath, derivedVersion = null, extra = {}) {
+  return {
+    executablePath,
+    probeEligible: true,
+    resourceLayout: 'COMPLETE',
+    derivedVersion,
+    versionEvidenceSource: derivedVersion ? 'PACKAGE_METADATA' : 'UNKNOWN',
+    filesystemIdentity: { status: 'PROVEN', key: `synthetic:${executablePath}`, canonicalPath: executablePath },
+    filesystemDiscovery: 'DISCOVERED',
+    selectionStatus: 'NOT_SELECTED',
+    diagnosticStatus: 'NOT_RUN',
+    versionConfirmedByExecution: false,
+    tested: false,
+    ...extra,
+  };
+}
 
 function completeBoundaryProbes({ gapMethod = null } = {}) {
   return ['powershell', 'cmd', 'node'].flatMap((method) => {
@@ -651,18 +674,16 @@ test('probe plan exposes active and same-version alternative executables for exp
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
     sandboxFullAutoAvailable: true,
-    matchingCompleteBundles: [{
-      executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
-      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-    }],
-    newerCompleteBundles: [],
+    alternativeExecutables: [filesystemAlternative('C:\\matching\\codex.exe', 'codex-cli 0.145.0')],
   });
   assert.equal(plan.ready, true);
   assert.equal(plan.requiresSelection, true);
-  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'MATCHING_COMPLETE_BUNDLE']);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'ALTERNATIVE_EXECUTABLE']);
+  assert.equal(plan.candidates[1].derivedVersionRelation, 'MATCHING_COMPLETE_BUNDLE');
   assert.equal(plan.candidates[1].isAlternativeExecutable, true);
-  assert.match(plan.candidates[1].scopeNote, /does not validate the active PATH CLI/);
+  assert.match(plan.candidates[1].scopeNote, /not been selected, started, tested.*validate the active PATH CLI/i);
+  assert.equal(plan.candidates[1].testedVersion, null);
+  assert.equal(plan.candidates[1].sandboxState, 'NOT_RUN');
 });
 
 test('probe plan exposes active and newer alternative executables with a version warning state', () => {
@@ -672,16 +693,15 @@ test('probe plan exposes active and newer alternative executables with a version
     activeCodexPath: 'C:\\active\\codex.exe',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
-    newerCompleteBundles: [{
-      executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0-alpha.3.1', probeEligible: true,
-      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-    }],
+    alternativeExecutables: [filesystemAlternative('C:\\newer\\codex.exe', 'codex-cli 0.146.0-alpha.3.1')],
   });
   assert.equal(plan.requiresSelection, true);
-  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'NEWER_COMPLETE_BUNDLE']);
-  assert.equal(plan.candidates[1].versionMismatch, true);
-  assert.match(plan.candidates[1].scopeNote, /0\.146\.0-alpha\.3\.1/);
+  assert.deepEqual(plan.candidates.map((candidate) => candidate.source), ['ACTIVE_CLI', 'ALTERNATIVE_EXECUTABLE']);
+  assert.equal(plan.candidates[1].derivedVersionRelation, 'NEWER_COMPLETE_BUNDLE');
+  assert.equal(plan.candidates[1].derivedVersionMismatch, true);
+  assert.equal(plan.candidates[1].versionMismatch, false);
+  assert.equal(plan.candidates[1].displayedVersion, 'codex-cli 0.146.0-alpha.3.1');
+  assert.match(plan.candidates[1].scopeNote, /not been selected, started, tested/i);
 });
 
 test('probe plan exposes all three candidate classes in recommended order', () => {
@@ -691,19 +711,16 @@ test('probe plan exposes all three candidate classes in recommended order', () =
     activeCodexPath: 'C:\\active\\codex.exe',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
-    matchingCompleteBundles: [{
-      executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
-      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-    }],
-    newerCompleteBundles: [{
-      executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0', probeEligible: true,
-      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-    }],
+    alternativeExecutables: [
+      filesystemAlternative('C:\\matching\\codex.exe', 'codex-cli 0.145.0'),
+      filesystemAlternative('C:\\newer\\codex.exe', 'codex-cli 0.146.0'),
+    ],
   });
   assert.deepEqual(plan.candidates.map((candidate) => candidate.source), [
-    'ACTIVE_CLI', 'MATCHING_COMPLETE_BUNDLE', 'NEWER_COMPLETE_BUNDLE',
+    'ACTIVE_CLI', 'ALTERNATIVE_EXECUTABLE', 'ALTERNATIVE_EXECUTABLE',
+  ]);
+  assert.deepEqual(plan.candidates.slice(1).map((candidate) => candidate.derivedVersionRelation), [
+    'MATCHING_COMPLETE_BUNDLE', 'NEWER_COMPLETE_BUNDLE',
   ]);
 });
 
@@ -721,11 +738,7 @@ test('probe plan deduplicates an executable reached through a junction alias and
     activeCodexPath: path.join(currentDir, 'bin', 'codex.exe'),
     codexVersion: 'codex-cli 0.146.0',
     activeBundle: { complete: false, probeEligible: true, resourceLayout: 'COMPLETE' },
-    matchingCompleteBundles: [{
-      executablePath: path.join(releaseBin, 'codex.exe'), version: 'codex-cli 0.146.0', probeEligible: true,
-      resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-    }],
+    alternativeExecutables: [filesystemAlternative(path.join(releaseBin, 'codex.exe'), 'codex-cli 0.146.0')],
   });
   assert.equal(plan.candidates.length, 1);
   assert.equal(plan.candidates[0].source, 'ACTIVE_CLI');
@@ -761,20 +774,24 @@ test('probe plan offers an active probe-eligible standalone executable when sand
   assert.equal(plan.testedBundleMetadata.runtimeStartup, 'NOT_TESTED');
 });
 
-test('probe plan offers a same-version complete bundle when the active bundle is incomplete', () => {
+test('probe plan offers a filesystem-discovered same-version candidate for explicit diagnostics when the active bundle is incomplete', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
     sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
-    matchingCompleteBundles: [{ executablePath: 'C:\\bundle\\codex.exe', version: 'codex-cli 0.145.0', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true, sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT }],
+    codexVersion: 'codex-cli 0.145.0',
+    alternativeExecutables: [filesystemAlternative('C:\\bundle\\codex.exe', 'codex-cli 0.145.0')],
   });
   assert.equal(plan.ready, true);
   assert.equal(plan.requiresConfirmation, true);
-  assert.equal(plan.source, 'MATCHING_COMPLETE_BUNDLE');
+  assert.equal(plan.source, 'ALTERNATIVE_EXECUTABLE');
+  assert.equal(plan.derivedVersionRelation, 'MATCHING_COMPLETE_BUNDLE');
   assert.equal(plan.codexExe, 'C:\\bundle\\codex.exe');
-  assert.equal(plan.fullAutoAvailable, true);
+  assert.equal(plan.fullAutoAvailable, false);
+  assert.equal(plan.testedVersion, null);
+  assert.equal(plan.sandboxState, 'NOT_RUN');
 });
 
 test('probe plan fails closed when no complete matching bundle exists', () => {
@@ -814,7 +831,7 @@ test('Codex version comparison recognizes a newer prerelease bundle', () => {
   assert.equal(compareCodexVersions('codex-cli 0.145.0', 'codex-cli 0.145.0'), 0);
 });
 
-test('probe plan offers a newer complete test-ready bundle with an explicit version warning', () => {
+test('probe plan offers a filesystem-derived newer candidate but does not call it test-ready before selection', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
     sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
@@ -822,40 +839,33 @@ test('probe plan offers a newer complete test-ready bundle with an explicit vers
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
-    matchingCompleteBundles: [],
-    newerCompleteBundles: [{
-      executablePath: 'C:\\bundle\\codex.exe',
-      version: 'codex-cli 0.146.0-alpha.3',
-      sandboxState: 'AVAILABLE',
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-      sandboxFullAutoAvailable: false,
-    }],
+    alternativeExecutables: [filesystemAlternative('C:\\bundle\\codex.exe', 'codex-cli 0.146.0-alpha.3')],
   });
   assert.equal(plan.ready, true);
   assert.equal(plan.requiresConfirmation, true);
-  assert.equal(plan.source, 'NEWER_COMPLETE_BUNDLE');
-  assert.equal(plan.versionMismatch, true);
+  assert.equal(plan.source, 'ALTERNATIVE_EXECUTABLE');
+  assert.equal(plan.derivedVersionRelation, 'NEWER_COMPLETE_BUNDLE');
+  assert.equal(plan.versionMismatch, false);
   assert.equal(plan.activeVersion, 'codex-cli 0.145.0');
-  assert.equal(plan.testedVersion, 'codex-cli 0.146.0-alpha.3');
+  assert.equal(plan.testedVersion, null);
+  assert.equal(plan.displayedVersion, 'codex-cli 0.146.0-alpha.3');
   assert.equal(plan.fullAutoAvailable, false);
+  assert.equal(plan.sandboxState, 'NOT_RUN');
 });
 
-test('probe plan rejects a newer complete bundle whose sandbox command is not test-ready', () => {
+test('probe plan rejects an unproven filesystem candidate before any diagnostic process', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
-    matchingCompleteBundles: [],
-    newerCompleteBundles: [{
-      executablePath: 'C:\\bundle\\codex.exe',
-      version: 'codex-cli 0.146.0-alpha.3',
-      sandboxState: 'DETECTION_ERROR',
-    }],
-    completeBundles: [{ version: 'codex-cli 0.146.0-alpha.3', sandboxState: 'DETECTION_ERROR' }],
+    alternativeExecutables: [filesystemAlternative('C:\\bundle\\codex.exe', 'codex-cli 0.146.0-alpha.3', {
+      filesystemIdentity: { status: 'UNPROVEN', key: 'unproven', canonicalPath: null },
+    })],
+    completeBundles: [{ derivedVersion: '0.146.0-alpha.3' }],
   });
   assert.equal(plan.ready, false);
-  assert.match(plan.reason, /none provide/i);
+  assert.match(plan.reason, /provable identity/i);
 });
 
 test('alternative bundle pass is not reported as validation of the active CLI', () => {
@@ -868,23 +878,17 @@ test('alternative bundle pass is not reported as validation of the active CLI', 
 });
 
 
-test('a test-ready newer bundle can be offered even when the incomplete active CLI sandbox command is unavailable', () => {
+test('a filesystem candidate can be selected for bound diagnostics when the incomplete active CLI sandbox command is unavailable', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'UNSUPPORTED',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
-    matchingCompleteBundles: [],
-    newerCompleteBundles: [{
-      executablePath: 'C:\\bundle\\codex.exe',
-      version: 'codex-cli 0.146.0-alpha.3',
-      sandboxState: 'AVAILABLE',
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
-      sandboxFullAutoAvailable: false,
-    }],
+    alternativeExecutables: [filesystemAlternative('C:\\bundle\\codex.exe', 'codex-cli 0.146.0-alpha.3')],
   });
   assert.equal(plan.ready, true);
-  assert.equal(plan.source, 'NEWER_COMPLETE_BUNDLE');
+  assert.equal(plan.source, 'ALTERNATIVE_EXECUTABLE');
+  assert.equal(plan.derivedVersionRelation, 'NEWER_COMPLETE_BUNDLE');
 });
 
 
@@ -1950,7 +1954,7 @@ test('writeReport recursively redacts host-preflight and nested local paths from
     activeBundle: { complete: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', missing: [] },
     matchingCompleteBundles: [], newerCompleteBundles: [], standalonePackages: [],
     codexHome: `${userRoot}\\.codex`, authFilePresent: false,
-    doctor: { status: 'FAILED', ok: false, error: `${userRoot}\\.codex\\doctor.log` },
+    doctor: { status: 'ERROR', ok: false, error: `${userRoot}\\.codex\\doctor.log` },
     ruleFiles: [`${userRoot}\\.codex\\rules\\default.rules`], sandboxWindowsState: 'AVAILABLE', sandboxHelpError: null,
     config: {
       exists: true, path: `${userRoot}\\.codex\\config.toml`, sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null,
@@ -2495,16 +2499,51 @@ test('alternative standalone command-runner failure confirms helper resolution b
   assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
 });
 
-test('codex doctor is read-only inventory evidence and invalid output is non-fatal', () => {
+test('Doctor states keep skipped, unavailable, error, and completed evidence distinct', () => {
+  const skipped = createCodexDoctorInventoryStatus(true);
+  assert.equal(skipped.status, 'NOT_RUN');
+  assert.equal(skipped.ok, false);
+  assert.equal(skipped.error, null);
+  assert.match(skipped.reason, /no Doctor process was started/i);
+
+  const unavailable = createCodexDoctorInventoryStatus(false);
+  assert.equal(unavailable.status, 'UNAVAILABLE');
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.error, null);
+
   const ok = parseCodexDoctorOutput({ status: 0, stdout: JSON.stringify({ overallStatus: 'ok', checks: { installation: { status: 'ok' }, runtime: { status: 'ok' } } }), stderr: '' });
   assert.equal(ok.status, 'COMPLETED');
   assert.equal(ok.ok, true);
   assert.equal(ok.installationStatus, 'ok');
   const invalid = parseCodexDoctorOutput({ status: 0, stdout: 'not-json', stderr: '' });
-  assert.equal(invalid.status, 'INVALID_JSON');
+  assert.equal(invalid.status, 'ERROR');
   assert.equal(invalid.ok, false);
   const failed = parseCodexDoctorOutput({ status: 1, stdout: '', stderr: 'doctor failed' });
-  assert.equal(failed.status, 'FAILED');
+  assert.equal(failed.status, 'ERROR');
+});
+
+test('production inventory contains no Doctor subprocess invocation', () => {
+  const source = fs.readFileSync(new URL('../lib/core.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /\[\s*['"]doctor['"]\s*,\s*['"]--json['"]\s*\]/);
+  assert.doesNotMatch(source, /function\s+runCodexDoctor\b|runCodexDoctor\s*\(/);
+  const inventoryStart = source.indexOf('export function getCodexInventory');
+  const inventoryEnd = source.indexOf('export function isElevatedWindows', inventoryStart);
+  assert.ok(inventoryStart >= 0 && inventoryEnd > inventoryStart);
+  const inventorySource = source.slice(inventoryStart, inventoryEnd);
+  assert.match(inventorySource, /createCodexDoctorInventoryStatus\(installed\)/);
+  assert.doesNotMatch(inventorySource, /doctor[^\n]*(?:invoke|spawn|exec)/i);
+});
+
+test('auth.json inventory uses an existence check only', () => {
+  const calls = [];
+  const fileSystem = {
+    existsSync(candidate) {
+      calls.push(candidate);
+      return true;
+    },
+  };
+  assert.equal(authFileExists('C:\\Synthetic\\CodexHome', fileSystem), true);
+  assert.deepEqual(calls, [path.join('C:\\Synthetic\\CodexHome', 'auth.json')]);
 });
 
 test('share-safe payload redacts standalone paths and nested sandbox diagnostics', () => {
@@ -3079,7 +3118,7 @@ test('standalone executable identity change before execution fails closed withou
   }
 });
 
-test('alternative standalone identity mismatch remains targeted to the tested bundle', (t) => {
+test('alternative standalone identity mismatch remains targeted to the selected but untested alternative', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-standalone-alternative-revalidate-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const release = path.join(root, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
@@ -3095,22 +3134,27 @@ test('alternative standalone identity mismatch remains targeted to the tested bu
     sandboxHelperInPath: false,
     sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED',
     completeBundles: [],
-    matchingCompleteBundles: [{
+    alternativeExecutables: [{
       ...testedBundle,
       executablePath: executable,
-      version: 'codex-cli 0.146.0',
-      sandboxState: 'AVAILABLE',
-      sandboxFullAutoAvailable: true,
-      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
+      derivedVersion: 'codex-cli 0.146.0',
+      versionEvidenceSource: 'PACKAGE_METADATA',
+      filesystemIdentity: { status: 'PROVEN', key: resolveFilesystemIdentity(executable).key, canonicalPath: executable },
     }],
+    matchingCompleteBundles: [],
     newerCompleteBundles: [],
     doctor: { status: 'COMPLETED', ok: true },
     config: { warnings: [] },
     ruleFiles: [],
   };
   const plan = selectCodexProbePlan(inventory);
-  assert.equal(plan.source, 'MATCHING_COMPLETE_BUNDLE');
+  assert.equal(plan.source, 'ALTERNATIVE_EXECUTABLE');
+  assert.equal(plan.derivedVersionRelation, 'MATCHING_COMPLETE_BUNDLE');
   assert.equal(plan.isAlternativeExecutable, true);
+  const selectedExecutableBinding = {
+    selectedExecutablePath: executable,
+    expectedFilesystemIdentityKey: resolveFilesystemIdentity(executable).key,
+  };
   const originalExecutable = path.join(release, 'bin', 'codex-original.exe');
   fs.renameSync(executable, originalExecutable);
   fs.writeFileSync(executable, 'replacement executable');
@@ -3126,9 +3170,11 @@ test('alternative standalone identity mismatch remains targeted to the tested bu
     versionMismatch: plan.versionMismatch,
     testedBundleMetadata: plan.testedBundleMetadata,
     standaloneResourceBinding: plan.standaloneResourceBinding,
+    selectedExecutableBinding,
   });
   const summary = summarizeAssessment(inventory, [], sandbox, { assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
-  assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH' && item.target === 'TESTED_BUNDLE'), true);
+  assert.equal(summary.testedBundle, null);
+  assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH' && item.target === 'SELECTED_ALTERNATIVE'), true);
   assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH' && item.target === 'ACTIVE_CLI'), false);
   assert.equal(summary.recommendations.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED' && item.target === 'TESTED_BUNDLE'), false);
   assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED' && item.target === 'TESTED_BUNDLE'), false);
@@ -3545,6 +3591,47 @@ function targetedStandaloneInventory({
   };
 }
 
+test('skipped Doctor remains non-permissive and consistent across detailed and share-safe reports', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-doctor-skipped-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const inventory = targetedStandaloneInventory({
+    error: 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT',
+  });
+  inventory.doctor = createCodexDoctorInventoryStatus(true);
+  const summary = summarizeAssessment(inventory, [], null, {
+    assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY,
+    execpolicyRun: false,
+  });
+
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.cleanup.status, 'NOT_RUN');
+  assert.equal(summary.methodCoverage, 'NOT RUN');
+  assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
+  assert.equal(summary.recommendations.some((item) => item.code === 'DOCTOR_OK_BUT_RUNTIME_FAILED'), false);
+
+  const written = writeReport({
+    inventory,
+    rules: [],
+    sandbox: null,
+    appRoot: root,
+    assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY,
+  });
+  const detailText = fs.readFileSync(written.txtPath, 'utf8');
+  const supportText = fs.readFileSync(written.supportTxtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(written.supportJsonPath, 'utf8'));
+  assert.equal(written.payload.inventory.doctor.status, 'NOT_RUN');
+  assert.equal(written.payload.inventory.doctor.ok, false);
+  assert.equal(supportJson.environment.doctor.status, 'NOT_RUN');
+  assert.equal(supportJson.environment.doctor.ok, false);
+  assert.equal(supportJson.environment.doctor.errorPresent, false);
+  assert.equal(supportJson.environment.doctor.reason, inventory.doctor.reason);
+  for (const output of [detailText, supportText]) {
+    assert.match(output, /Codex doctor(?: status)?:\s+NOT_RUN/i);
+    assert.match(output, /no Doctor process was started/i);
+    assert.doesNotMatch(output, /Doctor passed|Doctor.*(?:authentication|network|update|session)/i);
+  }
+});
+
 function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, probes = [] } = {}) {
   return {
     status,
@@ -3786,4 +3873,373 @@ test('same-version matching bundle boundary gap is targeted to the tested bundle
   assert.equal(summary.activeCli.boundaryStatus, 'NOT TESTED');
   assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP' && item.target === 'TESTED_BUNDLE'), true);
   assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP' && item.target === 'ACTIVE_CLI'), false);
+});
+
+function createSyntheticClassicCodexBundle(directory, executableContent = 'synthetic executable') {
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'codex.exe'), executableContent);
+  fs.writeFileSync(path.join(directory, 'codex-windows-sandbox-setup.exe'), 'synthetic helper');
+  fs.writeFileSync(path.join(directory, 'codex-command-runner.exe'), 'synthetic runner');
+  return path.join(directory, 'codex.exe');
+}
+
+function supportedSandboxHelpOutput() {
+  return [
+    'Usage: codex sandbox [OPTIONS] [COMMAND]...',
+    '--permission-profile <NAME>',
+    '--cd <DIR>',
+    '--full-auto',
+  ].join('\n');
+}
+
+function syntheticInventoryOptions(activeCodexPath, bundlePaths, codexCalls) {
+  return {
+    platform: 'win32',
+    findCommandPath(command) {
+      return command === 'codex.exe' ? activeCodexPath : null;
+    },
+    invokeCodex(args, options) {
+      codexCalls.push({ args: [...args], codexExe: options.codexExe });
+      assert.equal(options.codexExe, activeCodexPath, 'inventory may invoke only the active PATH CLI');
+      if (args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.145.0', stderr: '' };
+      return { status: 0, stdout: supportedSandboxHelpOutput(), stderr: '' };
+    },
+    discoverStandalonePackages: () => [],
+    discoverCodexBundlePaths: () => bundlePaths,
+    commandInPath: () => false,
+    isElevatedWindows: () => false,
+    readSafeConfigSummary: (configPath) => ({ exists: false, path: configPath, sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null, warnings: [] }),
+    listRuleFiles: () => [],
+    authFileExists: () => false,
+  };
+}
+
+test('production inventory starts only the active PATH CLI and leaves one or many alternatives filesystem-only', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-inventory-no-alternative-start-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const alternatives = [
+    createSyntheticClassicCodexBundle(path.join(root, 'alternative-a')),
+    createSyntheticClassicCodexBundle(path.join(root, 'alternative-b')),
+  ];
+  const codexCalls = [];
+  const inventory = getCodexInventory(
+    { CODEX_HOME: path.join(root, 'codex-home'), CANARY_NODE_SOURCE: 'TEST' },
+    syntheticInventoryOptions(activeCodexPath, alternatives, codexCalls)
+  );
+
+  assert.deepEqual(codexCalls.map((call) => call.args), [['--version'], ['sandbox', '--help']]);
+  assert.equal(inventory.alternativeExecutables.length, 2);
+  for (const candidate of inventory.alternativeExecutables) {
+    assert.equal(candidate.filesystemDiscovery, 'DISCOVERED');
+    assert.equal(candidate.selectionStatus, 'NOT_SELECTED');
+    assert.equal(candidate.diagnosticStatus, 'NOT_RUN');
+    assert.equal(candidate.versionConfirmedByExecution, false);
+    assert.equal(candidate.tested, false);
+    assert.equal(candidate.validatesActiveCli, false);
+    assert.equal(candidate.validatesBoundary, false);
+  }
+});
+
+test('active aliases are not independent alternatives while copies and same-version release directories remain separate', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-alternative-identity-inventory-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const activeAlias = path.join(root, 'active-alias.exe');
+  fs.linkSync(activeCodexPath, activeAlias);
+  const copy = createSyntheticClassicCodexBundle(path.join(root, 'copy'));
+  const firstHome = path.join(root, 'first-home');
+  const secondHome = path.join(root, 'second-home');
+  const firstRelease = path.join(firstHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  const secondRelease = path.join(secondHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(firstRelease, 'first release executable');
+  createSyntheticStandalonePackage(secondRelease, 'second release executable');
+  const standalonePackages = [...discoverStandalonePackages(firstHome), ...discoverStandalonePackages(secondHome)];
+  const alternatives = inventoryAlternativeCodexExecutables([
+    activeAlias,
+    copy,
+    path.join(firstRelease, 'bin', 'codex.exe'),
+    path.join(secondRelease, 'bin', 'codex.exe'),
+  ], { activeCodexPath, standalonePackages });
+
+  assert.equal(alternatives.length, 3);
+  assert.equal(alternatives.some((candidate) => candidate.executablePath === activeAlias), false);
+  assert.equal(alternatives.filter((candidate) => candidate.derivedVersion === '0.146.0').length, 2);
+  assert.notEqual(canonicalExistingPathKey(path.join(firstRelease, 'bin', 'codex.exe')), canonicalExistingPathKey(path.join(secondRelease, 'bin', 'codex.exe')));
+  assert.equal(alternatives.every((candidate) => candidate.diagnosticStatus === 'NOT_RUN'), true);
+});
+
+test('a realpath without filesystem object identity remains unproven and cannot satisfy a selection binding', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-unproven-realpath-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const executable = createSyntheticClassicCodexBundle(root);
+  const identity = resolveFilesystemIdentity(executable, {
+    statObjectIdentity: () => null,
+    realpathNative: (value) => value,
+    realpath: (value) => value,
+  });
+  assert.equal(identity.resolvedPath, path.resolve(executable));
+  assert.equal(identity.objectIdentity, null);
+  assert.equal(identity.proven, false);
+  assert.equal(validateSelectedExecutableBinding({
+    selectedExecutablePath: executable,
+    expectedFilesystemIdentityKey: identity.key,
+  }, executable, {
+    resolveFilesystemIdentity: () => identity,
+  }).valid, false);
+});
+
+test('a broken alternative link stays unproven, separate, and ineligible for a diagnostic start', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-broken-alternative-link-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const brokenLink = path.join(root, 'broken-codex.exe');
+  const conflictingPath = path.join(root, 'conflicting-codex.exe');
+  const alternatives = [filesystemAlternative(brokenLink, null, {
+    exists: false,
+    probeEligible: true,
+    filesystemIdentity: { status: 'UNPROVEN', key: `broken:${brokenLink}`, canonicalPath: null },
+  }), filesystemAlternative(conflictingPath, null, {
+    probeEligible: true,
+    filesystemIdentity: { status: 'CONFLICT', key: `conflict:${conflictingPath}`, canonicalPath: null, conflict: true },
+  })];
+  const plan = selectCodexProbePlan({
+    activeCodexPath, activeBundle: { probeEligible: false }, sandboxHelperInPath: false,
+    sandboxWindowsState: 'UNSUPPORTED', codexVersion: 'codex-cli 0.145.0',
+    alternativeExecutables: alternatives, completeBundles: alternatives,
+  });
+  assert.equal(plan.candidates.length, 0);
+});
+
+test('only an explicitly selected and identity-bound alternative may run version and sandbox-help diagnostics', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-selected-alternative-diagnostics-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const alternativeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'alternative'));
+  const alternatives = inventoryAlternativeCodexExecutables([alternativeCodexPath], { activeCodexPath, codexHome: root, standalonePackages: [] });
+  const inventory = {
+    codexVersion: 'codex-cli 0.145.0',
+    activeCodexPath,
+    activeBundle: { probeEligible: false },
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'UNSUPPORTED',
+    alternativeExecutables: alternatives,
+    completeBundles: alternatives,
+  };
+  inventory.sandboxProbePlan = selectCodexProbePlan(inventory);
+  const candidate = inventory.sandboxProbePlan.candidates[0];
+  const calls = [];
+
+  const forged = diagnoseExplicitlySelectedCodexExecutable(inventory, { ...candidate, expectedFilesystemIdentityKey: 'wrong' }, {
+    invokeCodex() { calls.push('unexpected'); return { status: 0, stdout: '' }; },
+  });
+  assert.equal(forged.ready, false);
+  assert.equal(forged.diagnosticStatus, 'NOT_RUN');
+  assert.deepEqual(calls, []);
+
+  const diagnosed = diagnoseExplicitlySelectedCodexExecutable(inventory, candidate, {
+    invokeCodex(args, options) {
+      calls.push({ args: [...args], codexExe: options.codexExe });
+      assert.equal(options.codexExe, alternativeCodexPath);
+      return args[0] === '--version'
+        ? { status: 0, stdout: 'codex-cli 0.145.0', stderr: '' }
+        : { status: 0, stdout: supportedSandboxHelpOutput(), stderr: '' };
+    },
+  });
+  assert.equal(diagnosed.ready, true);
+  assert.deepEqual(calls.map((call) => call.args), [['--version'], ['sandbox', '--help']]);
+  assert.equal(validateSelectedExecutableBinding(diagnosed.selectedExecutableBinding, alternativeCodexPath).valid, true);
+  assert.equal(alternatives[0].selectionStatus, 'SELECTED');
+  assert.equal(alternatives[0].diagnosticStatus, 'COMPLETED');
+  assert.equal(alternatives[0].versionConfirmedByExecution, true);
+  assert.equal(alternatives[0].tested, false);
+});
+
+test('an unparseable selected version fails closed before sandbox-help', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-selected-invalid-version-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const alternativeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'alternative'));
+  const alternatives = inventoryAlternativeCodexExecutables([alternativeCodexPath], { activeCodexPath, standalonePackages: [] });
+  const inventory = {
+    codexVersion: 'codex-cli 0.145.0', activeCodexPath,
+    activeBundle: { probeEligible: false }, sandboxHelperInPath: false, sandboxWindowsState: 'UNSUPPORTED',
+    alternativeExecutables: alternatives, completeBundles: alternatives,
+  };
+  const candidate = selectCodexProbePlan(inventory).candidates[0];
+  const calls = [];
+  const result = diagnoseExplicitlySelectedCodexExecutable(inventory, candidate, {
+    invokeCodex(args) {
+      calls.push([...args]);
+      return { status: 0, stdout: 'not-a-codex-version', stderr: '' };
+    },
+  });
+  assert.equal(result.ready, false);
+  assert.match(result.reason, /unparseable version/i);
+  assert.deepEqual(calls, [['--version']]);
+  assert.equal(alternatives[0].sandboxState, 'NOT_RUN');
+});
+
+test('package metadata and executed version remain separate and a mismatch blocks sandbox-help', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-selected-metadata-mismatch-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const codexHome = path.join(root, 'codex-home');
+  const release = path.join(codexHome, 'packages', 'standalone', 'releases', '0.146.0-x86_64-pc-windows-msvc');
+  createSyntheticStandalonePackage(release);
+  const alternativeCodexPath = path.join(release, 'bin', 'codex.exe');
+  const alternatives = inventoryAlternativeCodexExecutables([alternativeCodexPath], {
+    activeCodexPath,
+    codexHome,
+    standalonePackages: discoverStandalonePackages(codexHome),
+  });
+  const inventory = {
+    platform: 'win32', release: 'synthetic', nodeVersion: process.version, nodeRuntimeSource: 'TEST',
+    nodeInPath: false, npmInPath: false, elevated: false, codexInstalled: true,
+    codexVersion: 'codex-cli 0.145.0', activeCodexPath, codexHome,
+    activeBundle: inspectCodexBundle(activeCodexPath, { standalonePackages: [] }),
+    sandboxHelperInPath: false, sandboxWindowsState: 'UNSUPPORTED', sandboxCommandContract: null,
+    alternativeExecutables: alternatives, completeBundles: alternatives,
+    matchingCompleteBundles: [], newerCompleteBundles: alternatives,
+    standalonePackages: discoverStandalonePackages(codexHome),
+    config: { exists: false, path: path.join(codexHome, 'config.toml'), warnings: [] },
+    ruleFiles: [], authFilePresent: false,
+  };
+  const candidate = selectCodexProbePlan(inventory).candidates[0];
+  const calls = [];
+  const result = diagnoseExplicitlySelectedCodexExecutable(inventory, candidate, {
+    invokeCodex(args) {
+      calls.push([...args]);
+      return { status: 0, stdout: 'codex-cli 0.145.0', stderr: '' };
+    },
+  });
+  assert.equal(result.ready, false);
+  assert.match(result.reason, /conflicts with.*package metadata/i);
+  assert.deepEqual(calls, [['--version']]);
+  assert.equal(alternatives[0].derivedVersion, '0.146.0');
+  assert.equal(alternatives[0].versionEvidenceSource, 'PACKAGE_METADATA');
+  assert.equal(alternatives[0].confirmedVersion, 'codex-cli 0.145.0');
+  assert.equal(alternatives[0].confirmedVersionEvidenceSource, 'EXECUTABLE_OUTPUT');
+
+  const report = writeReport({ inventory, rules: [], sandbox: null, appRoot: path.join(root, 'app'), assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  const detailText = fs.readFileSync(report.txtPath, 'utf8');
+  const supportText = fs.readFileSync(report.supportTxtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(report.supportJsonPath, 'utf8'));
+  assert.match(detailText, /Derived version:\s+0\.146\.0 \(PACKAGE_METADATA\)/);
+  assert.match(detailText, /Executed version:\s+codex-cli 0\.145\.0 \(EXECUTABLE_OUTPUT\)/);
+  assert.match(supportText, /Metadata-derived version:\s+0\.146\.0 from PACKAGE_METADATA/);
+  assert.match(supportText, /Executed version:\s+codex-cli 0\.145\.0 from EXECUTABLE_OUTPUT/);
+  assert.equal(supportJson.environment.alternativeExecutables[0].versionEvidenceSource, 'PACKAGE_METADATA');
+  assert.equal(supportJson.environment.alternativeExecutables[0].confirmedVersionEvidenceSource, 'EXECUTABLE_OUTPUT');
+});
+
+test('an alternative identity change after version diagnostics blocks sandbox-help before a second process start', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-selected-alternative-swap-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const alternativeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'alternative'));
+  const alternatives = inventoryAlternativeCodexExecutables([alternativeCodexPath], { activeCodexPath, codexHome: root, standalonePackages: [] });
+  const inventory = {
+    codexVersion: 'codex-cli 0.145.0', activeCodexPath,
+    activeBundle: { probeEligible: false }, sandboxHelperInPath: false, sandboxWindowsState: 'UNSUPPORTED',
+    alternativeExecutables: alternatives, completeBundles: alternatives,
+  };
+  const candidate = selectCodexProbePlan(inventory).candidates[0];
+  let calls = 0;
+  const result = diagnoseExplicitlySelectedCodexExecutable(inventory, candidate, {
+    invokeCodex() {
+      calls += 1;
+      const oldPath = `${alternativeCodexPath}.old`;
+      fs.renameSync(alternativeCodexPath, oldPath);
+      fs.writeFileSync(alternativeCodexPath, 'replacement executable');
+      return { status: 0, stdout: 'codex-cli 0.145.0', stderr: '' };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.ready, false);
+  assert.match(result.reason, /identity changed/i);
+});
+
+test('a classic alternative requires the unchanged explicit selection binding before sandbox setup creates files', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-classic-selection-binding-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const executable = createSyntheticClassicCodexBundle(path.join(root, 'alternative'));
+  const binding = {
+    selectedExecutablePath: executable,
+    expectedFilesystemIdentityKey: resolveFilesystemIdentity(executable).key,
+  };
+  fs.renameSync(executable, `${executable}.old`);
+  fs.writeFileSync(executable, 'replacement executable');
+  const appRoot = path.join(root, 'app');
+  const sandbox = runSandboxProbes({
+    appRoot,
+    sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
+    codexExe: executable,
+    codexSource: 'MATCHING_COMPLETE_BUNDLE',
+    testedCodexVersion: 'codex-cli 0.145.0',
+    activeCodexVersion: 'codex-cli 0.145.0',
+    isAlternativeExecutable: true,
+    selectedExecutableBinding: binding,
+    testedBundleMetadata: { installType: 'classic', resourceLayout: 'COMPLETE', probeEligible: true },
+  });
+  assert.equal(sandbox.status, 'SETUP_FAILED');
+  assert.equal(sandbox.selectionBindingStatus, 'FAILED');
+  assert.equal(sandbox.setupFailureCode, 'EXECUTABLE_IDENTITY_MISMATCH');
+  assert.equal(sandbox.codexProcessStarted, false);
+  assert.equal(fs.existsSync(path.join(appRoot, 'runs')), false);
+  const summary = summarizeAssessment({
+    codexVersion: 'codex-cli 0.145.0', config: { warnings: [] },
+    activeBundle: { complete: false, resourceLayout: 'MISSING' },
+  }, [], sandbox, { execpolicyRun: false });
+  assert.equal(summary.testedBundle, null);
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.recommendations.find((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH')?.title, 'Selected executable identity changed');
+
+  const reportInventory = {
+    platform: 'win32', release: 'synthetic', nodeVersion: process.version, nodeRuntimeSource: 'TEST',
+    nodeInPath: false, npmInPath: false, elevated: false, codexInstalled: true,
+    codexVersion: 'codex-cli 0.145.0', activeCodexPath: null, codexHome: root,
+    activeBundle: { complete: false, probeEligible: false, resourceLayout: 'MISSING' },
+    sandboxHelperInPath: false, sandboxWindowsState: 'UNSUPPORTED', sandboxCommandContract: null,
+    alternativeExecutables: [filesystemAlternative(executable)], matchingCompleteBundles: [], newerCompleteBundles: [],
+    standalonePackages: [], config: { exists: false, path: path.join(root, 'config.toml'), warnings: [] },
+    ruleFiles: [], authFilePresent: false,
+  };
+  const report = writeReport({ inventory: reportInventory, rules: [], sandbox, appRoot: path.join(root, 'report-app'), assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  const detailText = fs.readFileSync(report.txtPath, 'utf8');
+  const supportText = fs.readFileSync(report.supportTxtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(report.supportJsonPath, 'utf8'));
+  assert.match(detailText, /TESTED BUNDLE[\s\S]*\(not tested\)/);
+  assert.doesNotMatch(supportText, /Tested bundle source:/);
+  assert.equal(supportJson.summary.testedBundle, null);
+});
+
+test('alternative inventory semantics agree across detail and share-safe TXT and JSON reports', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-alternative-report-semantics-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const activeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'active'));
+  const alternativeCodexPath = createSyntheticClassicCodexBundle(path.join(root, 'alternative'));
+  const codexCalls = [];
+  const inventory = getCodexInventory(
+    { CODEX_HOME: path.join(root, 'codex-home'), CANARY_NODE_SOURCE: 'TEST' },
+    syntheticInventoryOptions(activeCodexPath, [alternativeCodexPath], codexCalls)
+  );
+  const report = writeReport({ inventory, rules: [], sandbox: null, appRoot: path.join(root, 'app'), assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY });
+  const detailText = fs.readFileSync(report.txtPath, 'utf8');
+  const detailJson = JSON.parse(fs.readFileSync(report.jsonPath, 'utf8'));
+  const supportText = fs.readFileSync(report.supportTxtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(report.supportJsonPath, 'utf8'));
+
+  assert.match(detailText, /Filesystem discovery:\s+DISCOVERED/);
+  assert.match(detailText, /Selection:\s+NOT_SELECTED/);
+  assert.match(detailText, /Diagnostic process:\s+NOT_RUN/);
+  assert.match(detailText, /Tested bundle:\s+no/);
+  assert.equal(detailJson.inventory.alternativeExecutables[0].versionConfirmedByExecution, false);
+  assert.equal(detailJson.summary.testedBundle, null);
+  assert.match(supportText, /DISCOVERED[\s\S]*NOT_SELECTED \/ NOT_RUN[\s\S]*tested no/);
+  assert.equal(supportJson.environment.alternativeExecutables[0].tested, false);
+  assert.equal(supportJson.environment.alternativeExecutables[0].validatesActiveCli, false);
+  assert.equal(supportJson.environment.alternativeExecutables[0].validatesBoundary, false);
+  assert.doesNotMatch(supportText, /\\/);
 });

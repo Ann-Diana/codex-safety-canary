@@ -2,6 +2,7 @@
 import { stdin as input, stdout as output } from 'node:process';
 import {
   getAppRoot,
+  diagnoseExplicitlySelectedCodexExecutable,
   getCodexInventory,
   getLatestReport,
   launchDetachedProcess,
@@ -18,6 +19,7 @@ const cli = createCanaryCli({
   input,
   output,
   getInventory: getCodexInventory,
+  diagnoseSelectedCodexExecutable: diagnoseExplicitlySelectedCodexExecutable,
   runExecpolicyCoverage,
   runSandboxProbes,
   writeReport,
