@@ -1,0 +1,52 @@
+{
+  "fixtureSchemaVersion": 1,
+  "id": "openai-codex-36179",
+  "issue": {
+    "repository": "openai/codex",
+    "number": 36179,
+    "url": "https://github.com/openai/codex/issues/36179"
+  },
+  "knownAffectedVersions": ["0.146.0"],
+  "capturedOn": "2026-08-30",
+  "evidenceBoundary": [
+    "codex execpolicy check evaluates policy but does not execute the checked command.",
+    "A matcher result or current host resolution does not prove the executable path used by a later PowerShell execution.",
+    "The fixture does not claim a sandbox escape or perform an attack."
+  ],
+  "cases": [
+    {
+      "id": "absolute-rule-bare-command-no-match",
+      "policyRule": { "prefix": ["C:\\Synthetic\\npm\\playwright-cli.ps1"], "decision": "allow" },
+      "command": ["playwright-cli", "--version"],
+      "resolvedCommandPath": "C:\\Synthetic\\npm\\playwright-cli.ps1",
+      "output": { "matchedRules": [] },
+      "expected": { "policyStatus": "NO_MATCH", "ruleBinding": "NO_MATCH", "executionBinding": "NOT_PROVEN" }
+    },
+    {
+      "id": "absolute-rule-absolute-command-match",
+      "policyRule": { "prefix": ["C:\\Synthetic\\npm\\playwright-cli.ps1"], "decision": "allow" },
+      "command": ["C:\\Synthetic\\npm\\playwright-cli.ps1", "--version"],
+      "resolvedCommandPath": "C:\\Synthetic\\npm\\playwright-cli.ps1",
+      "output": {
+        "matchedRules": [
+          { "prefixRuleMatch": { "matchedPrefix": ["C:\\Synthetic\\npm\\playwright-cli.ps1"], "decision": "allow" } }
+        ],
+        "decision": "allow"
+      },
+      "expected": { "policyStatus": "OK", "decision": "allow", "ruleBinding": "CONFIRMED", "executionBinding": "NOT_PROVEN" }
+    },
+    {
+      "id": "bare-rule-bare-command-match",
+      "policyRule": { "prefix": ["playwright-cli"], "decision": "allow" },
+      "command": ["playwright-cli", "--version"],
+      "resolvedCommandPath": "C:\\Synthetic\\later-path\\playwright-cli.ps1",
+      "output": {
+        "matchedRules": [
+          { "prefixRuleMatch": { "matchedPrefix": ["playwright-cli"], "decision": "allow" } }
+        ],
+        "decision": "allow"
+      },
+      "expected": { "policyStatus": "OK", "decision": "allow", "ruleBinding": "NOT_PROVEN", "executionBinding": "NOT_PROVEN" }
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "fixtureSchemaVersion": 1,
+  "id": "openai-codex-41135",
+  "issue": {
+    "repository": "openai/codex",
+    "number": 41135,
+    "url": "https://github.com/openai/codex/issues/41135"
+  },
+  "knownAffectedVersions": ["0.146.0-alpha.9.2", "0.149.1", "0.150.1"],
+  "capturedOn": "2026-08-31",
+  "evidenceBoundary": [
+    "The fixture uses synthetic state only and performs no ACL, account, setup, or sandbox operation.",
+    "Resource or setup-marker presence does not prove that the invoking user can read and bind that marker to a working runtime.",
+    "The issue-bound versions do not establish that codex-cli 0.151.0 is affected or fixed."
+  ],
+  "syntheticInput": {
+    "activeCli": {
+      "source": "ACTIVE_CLI",
+      "identity": "fixture-active-codex-0.150.1-unreadable-marker",
+      "version": "codex-cli 0.150.1",
+      "resourceLayout": "COMPLETE"
+    },
+    "setupMarker": {
+      "present": true,
+      "readableByInvokingUser": false,
+      "runtimeBinding": "NOT_PROVEN"
+    },
+    "setupAttempts": 2,
+    "sandboxResult": {
+      "status": "SETUP_FAILED",
+      "codexProcessStarted": true,
+      "commandExitCode": 1,
+      "runtimeMarkerObserved": false,
+      "stderr": "orchestrator_helper_incomplete: setup helper exited successfully before setup completed"
+    },
+    "expected": {
+      "helperResolution": "NOT_TESTED",
+      "runtimeStartup": "FAILED",
+      "sandboxRuntime": "FAILED",
+      "boundary": "TEST ERROR",
+      "overall": "TEST ERROR / INCOMPLETE"
+    }
+  }
+}

@@ -10,6 +10,17 @@ import { buildSandboxRuntimeEvidence, deriveSandboxRuntimeObservation, getLatest
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+const TEST_SANDBOX_COMMAND_CONTRACT = Object.freeze({
+  syntax: 'GENERIC_PERMISSION_PROFILE',
+  supported: true,
+  usageLine: 'Usage: codex sandbox [OPTIONS] [COMMAND]...',
+  commandArgumentsSupported: true,
+  permissionProfileSupported: true,
+  workingDirectorySupported: true,
+  fullAutoAvailable: true,
+  reason: null,
+});
+
 function latestDetailJson(localAppData) {
   const reportsDir = path.join(localAppData, 'CodexSafetyCanary', 'reports');
   const files = fs.readdirSync(reportsDir)
@@ -78,6 +89,7 @@ function makeInventory(scenario, appRoot) {
     version: 'codex-cli 0.1.0-alpha.8',
     sandboxState: 'AVAILABLE',
     sandboxFullAutoAvailable: true,
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
   };
   const newerBundle = {
     ...matchingBundle,
@@ -85,6 +97,7 @@ function makeInventory(scenario, appRoot) {
     version: 'codex-cli 0.1.0-alpha.11',
     sandboxState: 'AVAILABLE',
     sandboxFullAutoAvailable: true,
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
   };
   const includeMatchingCandidate = matchingCandidateScenarios.has(scenario);
   const includeNewerCandidate = newerCandidateScenarios.has(scenario) || (!activeProbeReady && !matchingAlternative);
@@ -114,6 +127,7 @@ function makeInventory(scenario, appRoot) {
     codexInstalled: true,
     codexVersion: 'codex-cli 0.1.0-alpha.8',
     activeCodexPath,
+    activeCodexIdentity: 'synthetic-active-cli',
     activeBundle: activeStandalone
       ? { complete: false, probeEligible: true, installType: 'standalone', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', standaloneResourcesFound: true, standaloneRequiredResourcesPresent: true, resourceVersionMatchesActive: true, standalonePackage: { releaseVersion: '0.1.0-alpha.8' }, missing: ['codex-windows-sandbox-setup.exe', 'codex-command-runner.exe'] }
       : activeComplete
@@ -131,6 +145,7 @@ function makeInventory(scenario, appRoot) {
     config: { exists: false, path: path.join(appRoot, 'mock-codex-home', 'config.toml'), sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null, warnings: [] },
     ruleFiles: [],
     sandboxWindowsState: inventoryRuntimeFailure ? 'AVAILABLE_BUT_SETUP_FAILED' : 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     sandboxWindowsAvailable: !inventoryRuntimeFailure,
     sandboxFullAutoAvailable: true,
     sandboxSetupFailed: inventoryRuntimeFailure,
@@ -146,7 +161,9 @@ function makeInventory(scenario, appRoot) {
         : null,
   };
   inventory.sandboxHelpRuntimeEvidence = inventory.sandboxHelpError
-    ? buildSandboxRuntimeEvidence(inventory.sandboxHelpError, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' })
+    ? buildSandboxRuntimeEvidence(inventory.sandboxHelpError, {
+      step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: inventory.activeCodexIdentity,
+    })
     : null;
   const inventoryRuntimeObservation = deriveSandboxRuntimeObservation(inventory, null);
   inventory.activeBundle = {
@@ -204,6 +221,8 @@ function syntheticSandboxResult(options, appRoot, scenario) {
     versionMismatch: options.versionMismatch === true,
     testedBundleMetadata: options.testedBundleMetadata,
     scopeNote: options.scopeNote || null,
+    codexExecutableIdentity: options.codexSource === 'ACTIVE_CLI' ? 'synthetic-active-cli' : 'synthetic-tested-bundle',
+    sandboxCommandSyntax: options.sandboxCommandContract?.syntax || 'UNKNOWN',
   };
   if (['runner-process-failure', 'targeted-dual-failure'].includes(scenario)) {
     return {
@@ -216,6 +235,7 @@ function syntheticSandboxResult(options, appRoot, scenario) {
       probes: [],
       runtimeEvidence: buildSandboxRuntimeEvidence('codex-command-runner.exe CreateProcessWithLogonW failed: 2', {
         step: 'SANDBOX_SMOKE', codexSource: targetMetadata.codexSource,
+        codexExecutableIdentity: targetMetadata.codexExecutableIdentity,
       }),
       error: 'codex-command-runner.exe CreateProcessWithLogonW failed: 2',
     };
@@ -259,11 +279,12 @@ function syntheticSandboxResult(options, appRoot, scenario) {
   return {
     status: 'COMPLETED',
     ...targetMetadata,
+    codexProcessStarted: true,
     permissionProfile: ':workspace',
     layout: { runDir: path.join(appRoot, 'runs', `synthetic-${Date.now()}`) },
     hostPreflight: { passed: true, filesChecked: 2 },
     hostCalibrations: syntheticHostCalibrations(),
-    smoke: { passed: true, commandExitCode: 0, setupFailure: false, stderr: '' },
+    smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
     probes: [
       syntheticBoundaryProbe({ method: 'powershell', location: 'inside', label: 'PowerShell synthetic inside workspace', command: ['powershell', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
       syntheticBoundaryProbe({ method: 'powershell', location: 'outside', label: 'PowerShell synthetic outside workspace', command: ['powershell', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
@@ -434,11 +455,17 @@ test('CLI guided live-probe success path still reports all three runtime pairs',
   assert.equal(report.summary.recommendations.some((item) => item.code === 'BOUNDARY_ASSESSMENT_DECLINED'), false);
 });
 
-test('CLI sandbox-only live-probe success path still reports all three runtime pairs', async (t) => {
-  const { stdout, report, sandboxOptions } = await runCliScenario(t, 'sandbox-live-run', '4\ny\nm\n0\n');
+test('CLI sandbox-only live-probe success path keeps syntax and smoke consistent across reports', async (t) => {
+  const { stdout, report, localAppData, sandboxOptions } = await runCliScenario(t, 'sandbox-live-run', '4\ny\nm\n0\n');
+  const detailText = fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('.txt') && !name.endsWith('-support.txt')), 'utf8');
+  const supportText = fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('-support.txt')), 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('-support.json')), 'utf8'));
   assert.doesNotMatch(stdout, /Multiple probe-eligible Codex executables/);
   assert.equal(sandboxOptions.codexSource, 'ACTIVE_CLI');
+  assert.equal(sandboxOptions.sandboxCommandContract.syntax, 'GENERIC_PERMISSION_PROFILE');
   assert.equal(report.assessmentMode, 'SANDBOX ONLY');
+  assert.equal(report.inventory.sandboxCommandContract.syntax, 'GENERIC_PERMISSION_PROFILE');
+  assert.equal(report.sandbox.sandboxCommandSyntax, 'GENERIC_PERMISSION_PROFILE');
   assert.equal(report.summary.overall, 'BOUNDARY TEST PASSED');
   assert.equal(report.summary.sandboxRuntime, 'READY');
   assert.equal(report.summary.boundary, 'PASS');
@@ -447,6 +474,15 @@ test('CLI sandbox-only live-probe success path still reports all three runtime p
   assert.equal(report.summary.testedBundle.helperResolution, 'CONFIRMED');
   assert.equal(report.summary.testedBundle.runtimeStartup, 'READY');
   assert.equal(report.summary.recommendations.some((item) => item.code === 'BOUNDARY_ASSESSMENT_DECLINED'), false);
+  assert.equal(supportJson.environment.sandboxCommandState, 'AVAILABLE');
+  assert.equal(supportJson.environment.sandboxCommandSyntax, supportJson.environment.sandboxCommandState);
+  assert.equal(supportJson.environment.sandboxCommandContract, 'GENERIC_PERMISSION_PROFILE');
+  assert.equal(supportJson.sandbox.commandSyntax, 'GENERIC_PERMISSION_PROFILE');
+  assert.equal(supportJson.sandbox.smoke.passed, true);
+  for (const output of [stdout, detailText, supportText]) {
+    assert.match(output, /Runtime smoke test:\s+PASS/);
+    assert.match(output, /Sandbox syntax (?:contract|used):\s+GENERIC_PERMISSION_PROFILE/);
+  }
 });
 
 test('CLI Guided Assessment lets the user select a same-version alternative explicitly', async (t) => {

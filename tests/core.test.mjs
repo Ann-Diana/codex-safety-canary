@@ -17,9 +17,11 @@ import {
   discoverCodexBundlePaths,
   discoverStandalonePackages,
   inspectCodexBundle,
+  invokeCodex,
   normalizeCodexVersion,
   compareCodexVersions,
   selectCodexProbePlan,
+  findCommandPath,
   findDecision,
   parseExecpolicyOutput,
   isPathInside,
@@ -57,6 +59,19 @@ import {
   writeReport,
 } from '../lib/core.mjs';
 
+const TEST_SANDBOX_COMMAND_CONTRACT = Object.freeze({
+  syntax: 'GENERIC_PERMISSION_PROFILE',
+  supported: true,
+  usageLine: 'Usage: codex sandbox [OPTIONS] [COMMAND]...',
+  commandArgumentsSupported: true,
+  permissionProfileSupported: true,
+  workingDirectorySupported: true,
+  fullAutoAvailable: true,
+  reason: null,
+});
+const ACTIVE_EXECUTABLE_IDENTITY = 'synthetic-active-cli-identity';
+const TESTED_EXECUTABLE_IDENTITY = 'synthetic-tested-bundle-identity';
+
 function completeBoundaryProbes({ gapMethod = null } = {}) {
   return ['powershell', 'cmd', 'node'].flatMap((method) => {
     const insideId = `inside-workspace-${method}`;
@@ -91,9 +106,10 @@ function completedBoundarySandbox(overrides = {}) {
   return {
     status: 'COMPLETED',
     codexSource: 'ACTIVE_CLI',
+    codexProcessStarted: true,
     hostPreflight: { passed: true, filesChecked: 2 },
     hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
-    smoke: { passed: true, commandExitCode: 0, setupFailure: false, stderr: '' },
+    smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
     probes: completeBoundaryProbes(),
     cleanup: {
       status: 'COMPLETED', attempted: true, completed: true, errorPresent: false,
@@ -266,7 +282,10 @@ test('execpolicy parser accepts only recognized aggregate decisions', () => {
     assert.equal(result.decision, decision);
   }
   assert.equal(parseExecpolicyOutput({ decision: 'unexpected' }).status, 'UNKNOWN_SCHEMA');
-  assert.equal(parseExecpolicyOutput({ decision: 'allow', strictestDecision: 'forbidden' }).status, 'UNKNOWN_SCHEMA');
+  const strictest = parseExecpolicyOutput({ decision: 'allow', strictestDecision: 'forbidden' });
+  assert.equal(strictest.status, 'OK');
+  assert.equal(strictest.decision, 'forbidden');
+  assert.equal(parseExecpolicyOutput({ decision: 'allow', strictestDecision: 'future-decision' }).status, 'UNKNOWN_SCHEMA');
 });
 
 test('execpolicy parser ignores arbitrary nested decisions and is order independent', () => {
@@ -291,7 +310,12 @@ test('execpolicy matched-rule fallback computes the strictest known decision', (
   assert.equal(first.decision, 'forbidden');
   assert.equal(reversed.status, 'OK');
   assert.equal(reversed.decision, 'forbidden');
-  assert.equal(parseExecpolicyOutput({ decision: 'allow', matchedRules: [{ prefixRuleMatch: { decision: 'forbidden' } }] }).status, 'UNKNOWN_SCHEMA');
+  const aggregateConflict = parseExecpolicyOutput({ decision: 'allow', matchedRules: [{ prefixRuleMatch: { decision: 'forbidden' } }] });
+  assert.equal(aggregateConflict.status, 'OK');
+  assert.equal(aggregateConflict.decision, 'forbidden');
+  const withinRule = parseExecpolicyOutput({ matchedRules: [{ decision: 'allow', strictestDecision: 'prompt' }] });
+  assert.equal(withinRule.status, 'OK');
+  assert.equal(withinRule.decision, 'prompt');
   assert.equal(parseExecpolicyOutput({ matchedRules: [{ prefixRuleMatch: { decision: 'unknown' } }] }).status, 'UNKNOWN_SCHEMA');
 });
 
@@ -299,6 +323,59 @@ test('path containment rejects siblings', () => {
   const root = path.resolve('/tmp/root');
   assert.equal(isPathInside(path.join(root, 'a'), root), true);
   assert.equal(isPathInside(path.resolve('/tmp/root-other'), root), false);
+});
+
+test('Windows command lookup falls back through a process-local PowerShell lookup value', () => {
+  const calls = [];
+  const resolved = findCommandPath('synthetic-tool.exe', {
+    platform: 'win32',
+    spawnSyncImpl(command, args, options) {
+      calls.push({ command, args, options });
+      if (command === 'where.exe') return { status: 1, stdout: '', stderr: 'not found' };
+      return { status: 0, stdout: 'C:\\Synthetic Tools\\synthetic-tool.exe', stderr: '' };
+    },
+  });
+  assert.equal(resolved, 'C:\\Synthetic Tools\\synthetic-tool.exe');
+  assert.equal(calls[1].command, 'powershell.exe');
+  assert.equal(calls[1].args.at(-1).includes('Get-Command -Name $name'), true);
+  assert.equal(calls[1].options.env.CANARY_COMMAND_LOOKUP, 'synthetic-tool.exe');
+  assert.equal(calls[1].args.includes('synthetic-tool.exe'), false);
+});
+
+test('Windows Codex wrapper proves the executable start separately from the wrapper process', () => {
+  const wrapperOnly = invokeCodex(['sandbox', '--help'], {
+    platform: 'win32',
+    codexExe: 'C:\\Synthetic\\codex.exe',
+    spawnSync: () => ({ status: 127, stdout: '', stderr: 'could not start executable\r\n', error: null }),
+  });
+  assert.equal(wrapperOnly.codexProcessStarted, false);
+  assert.equal(wrapperOnly.stderr, 'could not start executable\r\n');
+
+  const spoofedByErrorPath = invokeCodex(['sandbox', '--help'], {
+    platform: 'win32',
+    codexExe: 'C:\\Synthetic\\codex.exe',
+    spawnSync: () => ({
+      status: 127,
+      stdout: '',
+      stderr: 'Could not start C:\\__CODEX_SAFETY_CANARY_EXECUTABLE_STARTED__\\codex.exe\r\n',
+      error: null,
+    }),
+  });
+  assert.equal(spoofedByErrorPath.codexProcessStarted, false);
+  assert.match(spoofedByErrorPath.stderr, /__CODEX_SAFETY_CANARY_EXECUTABLE_STARTED__/);
+
+  const childStarted = invokeCodex(['sandbox', '--help'], {
+    platform: 'win32',
+    codexExe: 'C:\\Synthetic\\codex.exe',
+    spawnSync: () => ({
+      status: 127,
+      stdout: '',
+      stderr: 'native diagnostic\r\n__CODEX_SAFETY_CANARY_EXECUTABLE_STARTED__\r\n',
+      error: null,
+    }),
+  });
+  assert.equal(childStarted.codexProcessStarted, true);
+  assert.equal(childStarted.stderr, 'native diagnostic\r\n');
 });
 
 test('safeRemoveRun only removes a child of runs', () => {
@@ -410,21 +487,34 @@ test('sandbox setup failures are not mistaken for boundary passes', () => {
   assert.notEqual(summary.overall, 'BOUNDARY TEST PASSED');
 });
 
-test('empty sandbox result is not a pass', () => {
+test('empty sandbox result without a Codex process remains not tested', () => {
   const summary = summarizeAssessment({ config: { warnings: [] } }, [], { codexSource: 'ACTIVE_CLI', probes: [] });
-  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
-  assert.equal(summary.boundary, 'TEST ERROR');
-  assert.equal(summary.methodCoverage, '0/3');
+  assert.equal(summary.overall, 'PARTIAL / NOT FULLY TESTED');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.methodCoverage, 'NOT RUN');
+  assert.equal(summary.testedBundle, null);
 });
 test('windows sandbox detection reports AVAILABLE from general sandbox help', () => {
   const result = detectWindowsSandboxFeature({
     status: 0,
-    stdout: 'Usage: codex sandbox [OPTIONS] -- <COMMAND>\nOptions:\n  --full-auto',
+    stdout: 'Usage: codex sandbox [OPTIONS] [COMMAND]...\nOptions:\n  -P, --permission-profile <NAME>\n  -C, --cd <DIR>\n  --full-auto',
     stderr: '',
   });
   assert.equal(result.state, 'AVAILABLE');
   assert.equal(result.available, true);
   assert.equal(result.fullAutoAvailable, true);
+  assert.equal(result.commandContract.syntax, 'GENERIC_PERMISSION_PROFILE');
+});
+
+test('windows sandbox detection rejects help that does not prove the runtime syntax contract', () => {
+  const result = detectWindowsSandboxFeature({
+    status: 0,
+    stdout: 'Usage: codex sandbox windows -- <COMMAND>',
+    stderr: '',
+  });
+  assert.equal(result.state, 'UNSUPPORTED');
+  assert.equal(result.available, false);
+  assert.equal(result.commandContract.syntax, 'UNKNOWN');
 });
 
 test('windows sandbox detection reports AVAILABLE_BUT_SETUP_FAILED', () => {
@@ -460,7 +550,8 @@ test('windows sandbox detection reports DETECTION_ERROR for start failure', () =
 });
 
 test('only AVAILABLE windows sandbox state allows live probes', () => {
-  assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'AVAILABLE' }), true);
+  assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'AVAILABLE', sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT }), true);
+  assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'AVAILABLE' }), false);
   assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED' }), false);
   assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'UNSUPPORTED' }), false);
   assert.equal(canRunLiveSandboxProbes({ sandboxWindowsState: 'DETECTION_ERROR' }), false);
@@ -468,8 +559,10 @@ test('only AVAILABLE windows sandbox state allows live probes', () => {
 
 test('sandbox command builder uses the explicit workspace permission profile and directory', () => {
   const workspace = path.resolve('C:/Synthetic Workspace');
-  assert.deepEqual(buildSandboxCommandArgs(['node', '--version'], { workspaceDir: workspace }), ['sandbox', '--permission-profile', ':workspace', '--cd', workspace, '--', 'node', '--version']);
-  assert.deepEqual(buildSandboxCommandArgs(['node', '--version'], { permissionProfile: ':read-only', workspaceDir: workspace }), ['sandbox', '--permission-profile', ':read-only', '--cd', workspace, '--', 'node', '--version']);
+  assert.deepEqual(buildSandboxCommandArgs(['node', '--version'], { workspaceDir: workspace, commandContract: TEST_SANDBOX_COMMAND_CONTRACT }), ['sandbox', '--permission-profile', ':workspace', '--cd', workspace, '--', 'node', '--version']);
+  assert.deepEqual(buildSandboxCommandArgs(['node', '--version'], { permissionProfile: ':read-only', workspaceDir: workspace, commandContract: TEST_SANDBOX_COMMAND_CONTRACT }), ['sandbox', '--permission-profile', ':read-only', '--cd', workspace, '--', 'node', '--version']);
+  assert.deepEqual(buildSandboxCommandArgs(['node', '--version'], { workspaceDir: workspace, commandContract: TEST_SANDBOX_COMMAND_CONTRACT, fullAuto: true }), ['sandbox', '--full-auto', '--permission-profile', ':workspace', '--cd', workspace, '--', 'node', '--version']);
+  assert.throws(() => buildSandboxCommandArgs(['node'], { workspaceDir: workspace }), /verified generic sandbox command contract/);
 });
 
 
@@ -494,7 +587,7 @@ test('text report includes sandbox feature state and diagnostic', () => {
     execpolicy: [],
     sandbox: null,
   });
-  assert.match(text, /Sandbox command syntax:\s+DETECTION_ERROR/);
+  assert.match(text, /Sandbox command state:\s+DETECTION_ERROR/);
   assert.match(text, /Sandbox diagnostic:\s+access denied/);
 });
 
@@ -535,6 +628,7 @@ test('version normalization compares codex-cli versions without surrounding text
 test('probe plan prefers the active complete CLI bundle', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: true, probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'CONFIRMED', runtimeStartup: 'NOT_TESTED' },
     sandboxFullAutoAvailable: true,
@@ -552,6 +646,7 @@ test('probe plan prefers the active complete CLI bundle', () => {
 test('probe plan exposes active and same-version alternative executables for explicit selection', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
@@ -559,6 +654,7 @@ test('probe plan exposes active and same-version alternative executables for exp
     matchingCompleteBundles: [{
       executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
       resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
     newerCompleteBundles: [],
   });
@@ -572,12 +668,14 @@ test('probe plan exposes active and same-version alternative executables for exp
 test('probe plan exposes active and newer alternative executables with a version warning state', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
     newerCompleteBundles: [{
       executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0-alpha.3.1', probeEligible: true,
       resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true,
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
   });
   assert.equal(plan.requiresSelection, true);
@@ -589,16 +687,19 @@ test('probe plan exposes active and newer alternative executables with a version
 test('probe plan exposes all three candidate classes in recommended order', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     codexVersion: 'codex-cli 0.145.0',
     activeBundle: { complete: true, probeEligible: true, resourceLayout: 'COMPLETE' },
     matchingCompleteBundles: [{
       executablePath: 'C:\\matching\\codex.exe', version: 'codex-cli 0.145.0', probeEligible: true,
       resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
     newerCompleteBundles: [{
       executablePath: 'C:\\newer\\codex.exe', version: 'codex-cli 0.146.0', probeEligible: true,
       resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
   });
   assert.deepEqual(plan.candidates.map((candidate) => candidate.source), [
@@ -616,12 +717,14 @@ test('probe plan deduplicates an executable reached through a junction alias and
   fs.symlinkSync(releaseDir, currentDir, process.platform === 'win32' ? 'junction' : 'dir');
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: path.join(currentDir, 'bin', 'codex.exe'),
     codexVersion: 'codex-cli 0.146.0',
     activeBundle: { complete: false, probeEligible: true, resourceLayout: 'COMPLETE' },
     matchingCompleteBundles: [{
       executablePath: path.join(releaseBin, 'codex.exe'), version: 'codex-cli 0.146.0', probeEligible: true,
       resourceLayout: 'COMPLETE', sandboxState: 'AVAILABLE',
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
   });
   assert.equal(plan.candidates.length, 1);
@@ -643,6 +746,7 @@ test('probe plan offers an active probe-eligible standalone executable when sand
   };
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\standalone\\current\\bin\\codex.exe',
     codexVersion: 'codex-cli 0.146.0',
     activeBundle,
@@ -660,10 +764,11 @@ test('probe plan offers an active probe-eligible standalone executable when sand
 test('probe plan offers a same-version complete bundle when the active bundle is incomplete', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
-    matchingCompleteBundles: [{ executablePath: 'C:\\bundle\\codex.exe', version: 'codex-cli 0.145.0', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true }],
+    matchingCompleteBundles: [{ executablePath: 'C:\\bundle\\codex.exe', version: 'codex-cli 0.145.0', sandboxState: 'AVAILABLE', sandboxFullAutoAvailable: true, sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT }],
   });
   assert.equal(plan.ready, true);
   assert.equal(plan.requiresConfirmation, true);
@@ -675,6 +780,7 @@ test('probe plan offers a same-version complete bundle when the active bundle is
 test('probe plan fails closed when no complete matching bundle exists', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: false },
     sandboxHelperInPath: false,
@@ -686,9 +792,13 @@ test('probe plan fails closed when no complete matching bundle exists', () => {
 
 test('setup failure summary keeps workspace deletion and boundary as untested', () => {
   const error = 'codex-windows-sandbox-setup.exe program not found';
-  const summary = summarizeAssessment({ config: { warnings: [] } }, [], {
+  const summary = summarizeAssessment({ config: { warnings: [] }, activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY }, [], {
     status: 'SETUP_FAILED',
-    runtimeEvidence: buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' }),
+    codexSource: 'ACTIVE_CLI',
+    codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    runtimeEvidence: buildSandboxRuntimeEvidence(error, {
+      step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    }),
     error,
     probes: [],
   });
@@ -707,6 +817,7 @@ test('Codex version comparison recognizes a newer prerelease bundle', () => {
 test('probe plan offers a newer complete test-ready bundle with an explicit version warning', () => {
   const plan = selectCodexProbePlan({
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     codexVersion: 'codex-cli 0.145.0',
     activeCodexPath: 'C:\\active\\codex.exe',
     activeBundle: { complete: false },
@@ -716,6 +827,7 @@ test('probe plan offers a newer complete test-ready bundle with an explicit vers
       executablePath: 'C:\\bundle\\codex.exe',
       version: 'codex-cli 0.146.0-alpha.3',
       sandboxState: 'AVAILABLE',
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
       sandboxFullAutoAvailable: false,
     }],
   });
@@ -767,6 +879,7 @@ test('a test-ready newer bundle can be offered even when the incomplete active C
       executablePath: 'C:\\bundle\\codex.exe',
       version: 'codex-cli 0.146.0-alpha.3',
       sandboxState: 'AVAILABLE',
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
       sandboxFullAutoAvailable: false,
     }],
   });
@@ -1103,6 +1216,17 @@ test('full structured three-runtime matrix still produces a boundary pass', () =
   assert.equal(summary.boundary, 'PASS');
   assert.equal(summary.methodCoverage, '3/3');
   assert.deepEqual(summary.nextSteps, []);
+});
+
+test('boundary pass requires explicit Codex process-start evidence', () => {
+  const sandbox = completedBoundarySandbox({
+    codexProcessStarted: false,
+    smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: false, stderr: '' },
+  });
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+  assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE');
+  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.notEqual(summary.overall, 'BOUNDARY TEST PASSED');
 });
 
 test('boundary cannot pass when every runtime control fails', () => {
@@ -1572,7 +1696,7 @@ test('public documentation distinguishes Canary Node requirements from Codex CLI
   assert.match(faq, /Node\.js 18 and 20 are end-of-life/i);
 
   assert.equal(packageJson.engines.node, '>=18');
-  assert.match(workflow, /node-version:\s*\[18, 20, 22\]/);
+  assert.match(workflow, /node-version:\s*\[18, 20, 22, 24\]/);
 });
 
 test('README references all nine authoritative screenshots exactly once with result-oriented alt text', () => {
@@ -2214,7 +2338,9 @@ test('foreign standalone resources do not create an active-CLI runtime diagnosti
 
 test('command runner process creation failures are distinct from helper resolution failures', () => {
   const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
-  const runtimeEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' });
+  const runtimeEvidence = buildSandboxRuntimeEvidence(error, {
+    step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+  });
   assert.equal(detectCommandRunnerProcessCreationFailure(error), false);
   assert.equal(detectCommandRunnerProcessCreationFailure(error, runtimeEvidence), true);
   assert.equal(detectSandboxHelperResolutionFailure(error), false);
@@ -2224,8 +2350,12 @@ test('command runner process creation failures are distinct from helper resoluti
     activeBundle: { complete: true, probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE', helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
     doctor: { ok: true },
     sandboxWindowsState: 'AVAILABLE',
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
   };
-  const summary = summarizeAssessment(inventory, [], { status: 'SETUP_FAILED', codexSource: 'ACTIVE_CLI', testedCodexVersion: 'codex-cli 0.146.0', probes: [], runtimeEvidence, error });
+  const summary = summarizeAssessment(inventory, [], {
+    status: 'SETUP_FAILED', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    testedCodexVersion: 'codex-cli 0.146.0', probes: [], runtimeEvidence, error,
+  });
   assert.equal(summary.sandboxRuntime, 'FAILED – PROCESS CREATION FAILED');
   assert.equal(summary.activeCli.helperResolution, 'CONFIRMED');
   assert.equal(summary.activeCli.runtimeStartup, 'FAILED');
@@ -2259,31 +2389,70 @@ test('unbound process-creation text never confirms helper resolution', () => {
 
 test('bound runtime evidence stays scoped to the selected executable', () => {
   const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
-  const activeEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI' });
+  const activeEvidence = buildSandboxRuntimeEvidence(error, {
+    step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE', codexExecutableIdentity: 'synthetic-other-bundle-identity',
+  });
   const mismatched = deriveSandboxRuntimeObservation({
     activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
   }, {
-    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', runtimeEvidence: activeEvidence,
+    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+    runtimeEvidence: activeEvidence,
     testedBundleMetadata: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' }, error,
   });
   assert.equal(mismatched.helperResolution, 'NOT_TESTED');
   assert.equal(mismatched.runtimeStartup, 'FAILED');
 
-  const testedEvidence = buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE' });
+  const testedEvidence = buildSandboxRuntimeEvidence(error, {
+    step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE', codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+  });
   const matched = deriveSandboxRuntimeObservation({}, {
-    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', runtimeEvidence: testedEvidence,
+    status: 'SETUP_FAILED', codexSource: 'NEWER_COMPLETE_BUNDLE', codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+    runtimeEvidence: testedEvidence,
     testedBundleMetadata: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' }, error,
   });
   assert.equal(matched.helperResolution, 'CONFIRMED');
   assert.equal(matched.runtimeStartup, 'FAILED');
 });
 
+test('bound runtime evidence stays scoped to help versus smoke invocation stages', () => {
+  const error = 'codex-command-runner.exe CreateProcessWithLogonW failed: 2';
+  const helpEvidence = buildSandboxRuntimeEvidence(error, {
+    step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+  });
+  const smokeEvidence = buildSandboxRuntimeEvidence(error, {
+    step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+  });
+
+  const helpAttachedToSmoke = deriveSandboxRuntimeObservation({
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+  }, {
+    status: 'SETUP_FAILED', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    runtimeEvidence: helpEvidence, error,
+  });
+  assert.equal(helpAttachedToSmoke.helperResolution, 'NOT_TESTED');
+  assert.equal(helpAttachedToSmoke.runtimeStartup, 'FAILED');
+  assert.equal(helpAttachedToSmoke.commandRunnerProcessCreationFailed, false);
+
+  const smokeAttachedToHelp = deriveSandboxRuntimeObservation({
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED' },
+    sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED', sandboxHelpRuntimeEvidence: smokeEvidence,
+    sandboxHelpError: error,
+  }, null);
+  assert.equal(smokeAttachedToHelp.helperResolution, 'NOT_TESTED');
+  assert.equal(smokeAttachedToHelp.commandRunnerProcessCreationFailed, false);
+});
+
 test('explicit bound setup-helper evidence fails helper resolution without a boundary pass', () => {
   const error = 'orchestrator_helper_launch_failed: codex-windows-sandbox-setup.exe ENOENT';
   const summary = summarizeAssessment({
     config: { warnings: [] }, sandboxWindowsState: 'AVAILABLE_BUT_SETUP_FAILED', sandboxSetupFailed: true,
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
     sandboxHelpError: error,
-    sandboxHelpRuntimeEvidence: buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' }),
+    sandboxHelpRuntimeEvidence: buildSandboxRuntimeEvidence(error, {
+      step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+    }),
     activeBundle: { helperResolution: 'NOT_TESTED', runtimeStartup: 'NOT_TESTED', resourceLayout: 'COMPLETE' },
   }, [], null, { assessmentMode: ASSESSMENT_MODES.CONFIGURATION_ONLY, execpolicyRun: false });
   assert.equal(summary.activeCli.helperResolution, 'FAILED');
@@ -2300,6 +2469,7 @@ test('alternative standalone command-runner failure confirms helper resolution b
   }, [], {
     status: 'SETUP_FAILED',
     codexSource: 'NEWER_COMPLETE_BUNDLE',
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
     testedCodexVersion: 'codex-cli 0.146.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
@@ -2312,6 +2482,7 @@ test('alternative standalone command-runner failure confirms helper resolution b
     probes: [],
     runtimeEvidence: buildSandboxRuntimeEvidence('codex-command-runner.exe CreateProcessWithLogonW failed: 2', {
       step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE',
+      codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
     }),
     error: 'codex-command-runner.exe CreateProcessWithLogonW failed: 2',
   }, { execpolicyRun: false });
@@ -2432,11 +2603,14 @@ function standaloneInventoryWithSandboxHelp(error = null, state = 'AVAILABLE_BUT
     codexVersion: 'codex-cli 0.146.0',
     config: { warnings: [] },
     doctor: { ok: true },
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
     sandboxWindowsState: state,
     sandboxSetupFailed: state === 'AVAILABLE_BUT_SETUP_FAILED',
     sandboxHelpError: error,
     sandboxHelpRuntimeEvidence: error
-      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' })
+      ? buildSandboxRuntimeEvidence(error, {
+        step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+      })
       : null,
     activeBundle: {
       complete: false,
@@ -2601,15 +2775,18 @@ test('failed active standalone helper keeps the specific diagnostic without a ge
     activeBundle,
     standalonePackages: [],
     sandboxWindowsState: 'AVAILABLE',
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
   }, [], {
     status: 'SETUP_FAILED',
     codexSource: 'ACTIVE_CLI',
+    codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
     testedCodexVersion: 'codex-cli 0.146.0',
     testedBundleMetadata,
     smoke: { passed: false, stderr: 'orchestrator_helper_launch_failed: program not found' },
     probes: [],
     runtimeEvidence: buildSandboxRuntimeEvidence('orchestrator_helper_launch_failed: program not found', {
       step: 'SANDBOX_SMOKE', codexSource: 'ACTIVE_CLI',
+      codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
     }),
     error: 'orchestrator_helper_launch_failed: program not found',
   }, { execpolicyRun: false });
@@ -2653,7 +2830,10 @@ test('successful smoke confirms runtime startup but not sandbox boundary pass by
       standaloneResourcesFound: true,
       standaloneRequiredResourcesPresent: true,
     },
-  }, [], { status: 'SMOKE_COMPLETED', codexSource: 'ACTIVE_CLI', smoke: { passed: true }, probes: [] }, { execpolicyRun: false });
+  }, [], {
+    status: 'SMOKE_COMPLETED', codexSource: 'ACTIVE_CLI', codexProcessStarted: true,
+    smoke: { passed: true, codexProcessStarted: true }, probes: [],
+  }, { execpolicyRun: false });
   assert.equal(summary.sandboxRuntime, 'READY');
   assert.equal(summary.boundary, 'NOT TESTED');
   assert.equal(summary.activeCli.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION CONFIRMED');
@@ -2682,6 +2862,7 @@ test('ready runtime with incomplete method evidence recommends runner review ins
   };
   const sandbox = completedBoundarySandbox({
     codexSource: 'NEWER_COMPLETE_BUNDLE',
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
     testedCodexVersion: 'codex-cli 0.146.0-alpha.3.1',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
@@ -2818,6 +2999,7 @@ test('probe plan binds current alias to the canonical standalone executable iden
     sandboxHelperInPath: false,
     sandboxWindowsState: 'AVAILABLE',
     sandboxFullAutoAvailable: true,
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     matchingCompleteBundles: [],
     newerCompleteBundles: [],
     completeBundles: [],
@@ -2843,6 +3025,7 @@ test('standalone executable identity change before execution fails closed withou
     activeBundle: bundle,
     sandboxHelperInPath: false,
     sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     matchingCompleteBundles: [],
     newerCompleteBundles: [],
     completeBundles: [],
@@ -2854,6 +3037,7 @@ test('standalone executable identity change before execution fails closed withou
   const sandbox = runSandboxProbes({
     appRoot: path.join(root, 'app'),
     sandboxWindowsState: plan.sandboxState,
+    sandboxCommandContract: plan.sandboxCommandContract,
     codexExe: plan.codexExe,
     codexSource: plan.source,
     testedCodexVersion: plan.testedVersion,
@@ -2880,7 +3064,8 @@ test('standalone executable identity change before execution fails closed withou
     sandboxWindowsState: 'AVAILABLE',
   };
   const summary = summarizeAssessment(inventory, [], sandbox, { assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
-  assert.equal(summary.boundary, 'TEST ERROR');
+  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.testedBundle, null);
   assert.equal(summary.recommendations.some((item) => item.code === 'EXECUTABLE_IDENTITY_MISMATCH'), true);
   assert.equal(summary.recommendations.some((item) => item.code === 'SANDBOX_SETUP_FAILED'), false);
 
@@ -2916,6 +3101,7 @@ test('alternative standalone identity mismatch remains targeted to the tested bu
       version: 'codex-cli 0.146.0',
       sandboxState: 'AVAILABLE',
       sandboxFullAutoAvailable: true,
+      sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
     }],
     newerCompleteBundles: [],
     doctor: { status: 'COMPLETED', ok: true },
@@ -2931,6 +3117,7 @@ test('alternative standalone identity mismatch remains targeted to the tested bu
 
   const sandbox = runSandboxProbes({
     sandboxWindowsState: plan.sandboxState,
+    sandboxCommandContract: plan.sandboxCommandContract,
     codexExe: plan.codexExe,
     codexSource: plan.source,
     testedCodexVersion: plan.testedVersion,
@@ -3277,6 +3464,7 @@ test('failed alternative standalone smoke reports staged evidence instead of a c
   }, [], {
     status: 'SETUP_FAILED',
     codexSource: 'NEWER_COMPLETE_BUNDLE',
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
     testedCodexVersion: 'codex-cli 0.146.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
@@ -3295,6 +3483,7 @@ test('failed alternative standalone smoke reports staged evidence instead of a c
     probes: [],
     runtimeEvidence: buildSandboxRuntimeEvidence('orchestrator_helper_launch_failed: program not found', {
       step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE',
+      codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
     }),
     error: 'orchestrator_helper_launch_failed: program not found',
   }, { execpolicyRun: false });
@@ -3322,6 +3511,7 @@ function targetedStandaloneInventory({
     codexInstalled: true,
     codexVersion: 'codex-cli 0.145.0',
     activeCodexPath: 'C:\\synthetic\\active\\codex.exe',
+    activeCodexIdentity: ACTIVE_EXECUTABLE_IDENTITY,
     activeBundle: {
       installType: 'standalone',
       complete: false,
@@ -3341,7 +3531,9 @@ function targetedStandaloneInventory({
     sandboxSetupFailed: sandboxState === 'AVAILABLE_BUT_SETUP_FAILED',
     sandboxHelpError: error,
     sandboxHelpRuntimeEvidence: error
-      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI' })
+      ? buildSandboxRuntimeEvidence(error, {
+        step: 'SANDBOX_HELP', codexSource: 'ACTIVE_CLI', codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
+      })
       : null,
     doctor: { status: doctorOk ? 'COMPLETED' : 'NOT_RUN', ok: doctorOk, overallStatus: doctorOk ? 'ok' : null },
     codexHome: 'C:\\synthetic\\codex-home',
@@ -3357,6 +3549,8 @@ function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, prob
   return {
     status,
     codexSource: 'NEWER_COMPLETE_BUNDLE',
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+    codexProcessStarted: true,
     testedCodexVersion: 'codex-cli 0.146.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
@@ -3375,10 +3569,12 @@ function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, prob
     hostPreflight: { passed: status === 'COMPLETED', filesChecked: status === 'COMPLETED' ? 2 : 0 },
     hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
     smoke: status === 'COMPLETED'
-      ? { passed: true, stderr: '' }
-      : { passed: false, stderr: error || '' },
+      ? { passed: true, codexProcessStarted: true, stderr: '' }
+      : { passed: false, codexProcessStarted: true, stderr: error || '' },
     runtimeEvidence: error
-      ? buildSandboxRuntimeEvidence(error, { step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE' })
+      ? buildSandboxRuntimeEvidence(error, {
+        step: 'SANDBOX_SMOKE', codexSource: 'NEWER_COMPLETE_BUNDLE', codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+      })
       : null,
     cleanup: status === 'COMPLETED'
       ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
@@ -3509,6 +3705,7 @@ function matchingAlternativeSandbox({ status = 'COMPLETED', probes = [], error =
   return {
     status,
     codexSource: 'MATCHING_COMPLETE_BUNDLE',
+    codexProcessStarted: true,
     testedCodexVersion: 'codex-cli 0.145.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: false,
@@ -3523,8 +3720,8 @@ function matchingAlternativeSandbox({ status = 'COMPLETED', probes = [], error =
     hostPreflight: { passed: status === 'COMPLETED', filesChecked: status === 'COMPLETED' ? 2 : 0 },
     hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
     smoke: status === 'COMPLETED'
-      ? { passed: true, stderr: '' }
-      : { passed: false, stderr: error || '' },
+      ? { passed: true, codexProcessStarted: true, stderr: '' }
+      : { passed: false, codexProcessStarted: true, stderr: error || '' },
     cleanup: status === 'COMPLETED'
       ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
       : { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null },

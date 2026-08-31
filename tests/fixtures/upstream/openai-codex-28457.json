@@ -1,0 +1,53 @@
+{
+  "fixtureSchemaVersion": 1,
+  "id": "openai-codex-28457",
+  "issue": {
+    "repository": "openai/codex",
+    "number": 28457,
+    "url": "https://github.com/openai/codex/issues/28457"
+  },
+  "knownAffectedVersions": ["0.140.0"],
+  "capturedOn": "2026-08-30",
+  "evidenceBoundary": [
+    "The fixture proves only staged diagnostic state transitions from synthetic input.",
+    "Resource discovery and doctor output do not prove helper resolution, runtime startup, or a sandbox boundary.",
+    "No conclusion is made about whether a later Codex version is affected or fixed."
+  ],
+  "syntheticInput": {
+    "activeCli": {
+      "source": "ACTIVE_CLI",
+      "identity": "fixture-active-codex-0.140.0",
+      "version": "codex-cli 0.140.0",
+      "installType": "standalone",
+      "launcherSeparatedFromPackagePath": true,
+      "resourceLayout": "COMPLETE",
+      "doctorStatus": "ok"
+    },
+    "setupHelperFailure": {
+      "text": "orchestrator_helper_launch_failed: helper=codex-windows-sandbox-setup.exe program not found",
+      "component": "SETUP_HELPER",
+      "expected": {
+        "helperResolution": "FAILED",
+        "runtimeStartup": "FAILED",
+        "boundary": "TEST ERROR"
+      }
+    },
+    "commandRunnerFailure": {
+      "text": "codex-command-runner.exe CreateProcessWithLogonW failed: 2",
+      "component": "COMMAND_RUNNER",
+      "expected": {
+        "helperResolution": "CONFIRMED",
+        "runtimeStartup": "FAILED",
+        "boundary": "TEST ERROR"
+      }
+    },
+    "alternativeBundle": {
+      "source": "NEWER_COMPLETE_BUNDLE",
+      "identity": "fixture-alternative-codex-0.146.0",
+      "version": "codex-cli 0.146.0",
+      "requiresExplicitSelection": true,
+      "expectedActiveBoundary": "NOT TESTED",
+      "expectedTestedBoundary": "PASS"
+    }
+  }
+}
