@@ -28,6 +28,10 @@ Under `%LOCALAPPDATA%\CodexSafetyCanary\reports`.
 
 No. It reports only whether the file exists. Authentication data is never opened or copied.
 
+## Does the Canary run codex doctor?
+
+No. This candidate skips `codex doctor` in Configuration-only, Execpolicy-only, Guided, and Sandbox-only. There is no Doctor consent question or executable Doctor path. Reports use `NOT_RUN` when the CLI is available and `UNAVAILABLE` when it is not. A skipped Doctor is not an error, warning, or protection result, and the Canary makes no Doctor-derived claim about authentication, runtime, Git, terminal, app or session inventory, network access, or updates.
+
 ## Are project-local rules tested?
 
 Not in the alpha. The disposable workspace is intentionally not a trusted real project. Version 0.1 tests user-level `.rules` files under `%CODEX_HOME%\rules` and labels that scope explicitly.
@@ -42,16 +46,22 @@ The Canary itself runs on Node.js. The Windows launcher normally uses Node.js fr
 
 This fallback belongs to the Codex desktop runtime environment; it does not mean that the native Codex CLI generally requires or bundles Node.js. It also does not imply that `npm` or a system-wide Node.js installation is available.
 
-Node.js 22 or 24 is recommended. Node.js 18, 20, and 22 are tested compatibility targets for this alpha, but Node.js 18 and 20 are end-of-life.
+Node.js 22 or 24 is recommended. Node.js 18, 20, 22, and 24 are configured compatibility targets for this alpha, but Node.js 18 and 20 are end-of-life.
+
+The repository CI candidate also includes Node.js 24 on Windows and Ubuntu. A local run proves only the Node.js version on which it was actually executed; configured CI rows are not reported as passed until CI has run them.
 
 
 ## Why does the Canary say that the active CLI bundle is incomplete?
 
 The Canary distinguishes two layouts. In a classic layout, the required Windows sandbox helper and command-runner executables sit beside `codex.exe`. In a standalone layout, matching helpers live under the package's `codex-resources` directory instead. A complete standalone resource layout is not reported as an incomplete bundle merely because runtime resolution has not yet been tested; resource presence, helper resolution, runtime startup, and boundary proof remain separate states.
 
+## What did the Alpha 12 Windows acceptance establish?
+
+The completed normal-user run with Canary `0.1.0-alpha.12` tested the active PATH CLI `0.151.0` and produced a complete boundary PASS. The earlier `0.145.0` run stopped at helper resolution and produced no boundary verdict. The Alpha 12 result is limited to the tested Codex version, installation, configuration, and `:workspace` permission-profile run; see the changelog and Windows test plan for the detailed states and evidence limits.
+
 ## What happens when another probe-eligible executable is found?
 
-The active PATH CLI remains the recommended default. If multiple probe-eligible local executables exist, the Canary shows a numbered choice with each source, version, exact path, resource layout, and sandbox status. A same-version or newer alternative must be selected explicitly, and the selected executable runs a harmless sandbox smoke test before any deletion probe.
+The active PATH CLI remains the recommended default. Alternative executables are first discovered and deduplicated only through filesystem evidence. Before selection, a path- or package-derived version is labeled as metadata, while the executable version and sandbox status remain unconfirmed. Configuration-only and Execpolicy-only never show a selection and never start an alternative. Guided and Sandbox-only require an explicit choice bound to one exact filesystem object before that executable may run `--version`. Its output must be parseable and must agree with package metadata when such metadata exists; otherwise diagnostics stop before `sandbox --help`. A separate confirmation is still required before its harmless smoke test and any deletion probe.
 
 Any result from an executable other than the active PATH CLI applies only to that alternative executable, even when both executables report the same Codex version. It does **not** prove that the incomplete active CLI found through `PATH` is protected. A newer alternative additionally carries a version-mismatch warning. The Canary never copies files, alters `PATH`, or modifies Codex.
 
@@ -66,7 +76,7 @@ No. It checks the active `PATH` command plus the known roots `%LOCALAPPDATA%\Ope
 
 ## Why is a newer probe-eligible executable offered instead of silently used?
 
-A split installation can leave an incomplete active CLI beside a newer probe-eligible executable installed by the Codex app. Silently substituting versions would make the report misleading. The Canary therefore asks first and labels the result as an alternative-bundle test.
+A split installation can leave an incomplete active CLI beside a newer probe-eligible executable installed by the Codex app. Silently substituting versions would make the report misleading. The Canary therefore performs only filesystem inventory first. Guided or Sandbox-only asks for an exact executable selection before starting that alternative for version and sandbox-syntax diagnostics, then labels every later result as alternative-bundle evidence.
 
 
 ## Why does the Canary need an inside-workspace deletion probe?
@@ -87,6 +97,14 @@ A retained outside file is meaningful only if the same runtime can delete its ma
 
 None of the six tested command forms matched a restrictive user-level execpolicy rule. This is additional rule coverage only. It does not mean that the Windows sandbox failed, and it is not the sandbox boundary score.
 
+## Why can an execpolicy rule match without proving the executable path?
+
+`codex execpolicy check` classifies the command tokens supplied to the checker; it does not execute them. An absolute-path rule can therefore fail to match a bare command name, while a bare-name rule can match without proving which executable a later shell invocation resolves. The Canary reports rule-path binding, observed host resolution, and execution binding separately. Host lookup is diagnostic only, and execution binding remains `NOT_PROVEN` unless controlled execution evidence exists. None of these execpolicy states is a sandbox-boundary result.
+
+## Why does the repository include upstream regression fixtures?
+
+Relevant Codex CLI failures are preserved as versioned, synthetic, offline fixtures so their evidence boundaries remain testable after the live environment changes. A fixture may contain a synthetic historical Doctor state solely to prove that such evidence cannot replace runtime or boundary proof; the current Canary does not execute Doctor. Resource presence remains separate from runtime and boundary proof, and policy matching remains separate from execution-path binding. A fixture is a regression contract, not evidence that the current local CLI still has the upstream defect.
+
 ## Why are the active CLI and tested bundle reported separately?
 
 A split installation can leave the `codex.exe` resolved through `PATH` incomplete while another complete local bundle exists. A successful test of the alternative bundle applies only to that exact executable and version. The active CLI remains `NOT TESTED` until its own bundle is complete and tested.
@@ -97,4 +115,4 @@ First check which layout the report identified. For an incomplete classic layout
 
 ## Which report should I attach to a public support issue?
 
-Use the automatically generated `-support.txt` report. It removes local usernames, absolute local paths, credential paths, and raw configuration contents while retaining diagnostic version, installation, runtime, and security-status information needed for support. “Share-safe” means risk-reduced, not anonymous or secret. Review it before posting because no automatic redaction can guarantee that every future diagnostic string is non-sensitive. The detailed report is intended for local diagnosis.
+Use the automatically generated `-support.txt` report. It removes local usernames, absolute local paths, credential paths, and raw configuration contents while retaining diagnostic version, installation, runtime, and security-status information needed for support. “Share-safe” means risk-reduced, not anonymous or secret. Review it before posting because no automatic redaction can guarantee that every future diagnostic string is non-sensitive. The detailed report is intended for local diagnosis. Never attach `latest.json`: it is only a local management pointer and contains absolute paths to all four report artifacts.

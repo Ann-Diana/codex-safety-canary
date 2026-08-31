@@ -1650,8 +1650,11 @@ test('share-safe reports disclose removed and retained categories plus manual re
   });
   const supportText = renderSupportReport(payload);
   assert.deepEqual(payload.sharingNotice, SHARE_SAFE_SHARING_NOTICE);
-  assert.equal(formatShareSafeSharingNotice(payload.sharingNotice), 'This support report removes local usernames, absolute local paths, credential paths, and raw configuration contents. It retains diagnostic version information, installation information, runtime information, and security-status information. Review it before public sharing.');
-  assert.match(supportText, /removes local usernames, absolute local paths, credential paths, and raw configuration contents/i);
+  assert.equal(payload.sharingNotice.riskNotice, 'Share-safe output reduces disclosure risk but guarantees neither anonymity nor secrecy.');
+  assert.equal(payload.sharingNotice.reviewNotice, 'Review it before public sharing.');
+  assert.equal(formatShareSafeSharingNotice(payload.sharingNotice), 'Share-safe output reduces disclosure risk but guarantees neither anonymity nor secrecy. Review it before public sharing. It is designed to remove local usernames, absolute local paths, credential paths, and raw configuration contents. It retains diagnostic version information, installation information, runtime information, and security-status information.');
+  assert.match(supportText, /guarantees neither anonymity nor secrecy/i);
+  assert.match(supportText, /designed to remove local usernames, absolute local paths, credential paths, and raw configuration contents/i);
   assert.match(supportText, /retains diagnostic version information, installation information, runtime information, and security-status information/i);
   assert.match(supportText, /Review it before public sharing/i);
   assert.equal(payload.environment.windowsRelease, '10.0.synthetic');
@@ -1703,7 +1706,7 @@ test('public documentation distinguishes Canary Node requirements from Codex CLI
   assert.match(workflow, /node-version:\s*\[18, 20, 22, 24\]/);
 });
 
-test('README references all nine authoritative screenshots exactly once with result-oriented alt text', () => {
+test('README references all twelve authoritative screenshots exactly once with result-oriented alt text', () => {
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const screenshots = [
     ['01-main-menu.png', 'Codex Safety Canary main menu with guided assessment, configuration review, execpolicy coverage and disposable Windows sandbox test options'],
@@ -1715,6 +1718,9 @@ test('README references all nine authoritative screenshots exactly once with res
     ['03-sandbox-only-report-dialog.png', 'Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED'],
     ['06-share-safe-support-report.png', 'Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review'],
     ['07-share-safe-badge.png', 'Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing'],
+    ['10-alpha12-menu.png', 'Rendered Alpha 12 Canary menu for version 0.1.0-alpha.12, derived from verified evidence rather than a raw live capture'],
+    ['11-alpha12-boundary-pass.png', 'Rendered Alpha 12 boundary PASS for active PATH CLI codex-cli 0.151.0 with complete three-of-three runtime coverage under the tested :workspace profile'],
+    ['12-alpha12-share-safe-report.png', 'Rendered Alpha 12 share-safe support excerpt with the anonymity and secrecy warning and manual public-sharing review reminder'],
   ];
   const screenshotAlts = Object.fromEntries(screenshots);
   const screenshotHeadings = [
@@ -1774,6 +1780,9 @@ test('README references all nine authoritative screenshots exactly once with res
   assert.match(screenshotAlts['07-share-safe-badge.png'], /review before public sharing/i);
   assert.match(screenshotAlts['08-executable-selection.png'], /limited to the selected executable/i);
   assert.match(screenshotAlts['09-alternative-bundle-boundary-pass.png'], /three-of-three.*active PATH CLI remains NOT TESTED/i);
+  assert.match(readme, /Rendered from verified Alpha 12 evidence[^.]*codex-cli 0\.151\.0[^.]*Windows `10\.0\.26200`[^.]*Node\.js `v24\.19\.0`[^.]*normal non-administrator[^.]*`:workspace`[^.]*not a raw live capture\./i);
+  assert.match(screenshotAlts['11-alpha12-boundary-pass.png'], /codex-cli 0\.151\.0.*three-of-three.*:workspace/i);
+  assert.match(screenshotAlts['12-alpha12-share-safe-report.png'], /anonymity and secrecy.*public-sharing review/i);
   assert.doesNotMatch(readme, /safe by construction/i);
   assert.equal(readme.includes('Boundary-test validity'), false);
   assert.doesNotMatch(readme, /run folder is removed after the report is written/i);
@@ -1785,11 +1794,11 @@ test('README references all nine authoritative screenshots exactly once with res
   assert.equal(fs.existsSync(new URL('../LICENSE', import.meta.url)), true);
 });
 
-test('all fifteen public PNGs are structurally valid and free of metadata-bearing chunks', () => {
+test('all eighteen public PNGs are structurally valid and free of metadata-bearing chunks', () => {
   const docsRoot = fileURLToPath(new URL('../docs/', import.meta.url));
   const pngFiles = fs.readdirSync(path.join(docsRoot, 'assets')).filter((name) => name.endsWith('.png')).map((name) => path.join(docsRoot, 'assets', name))
     .concat(fs.readdirSync(path.join(docsRoot, 'screenshots')).filter((name) => name.endsWith('.png')).map((name) => path.join(docsRoot, 'screenshots', name)));
-  assert.equal(pngFiles.length, 15);
+  assert.equal(pngFiles.length, 18);
   const allowedChunks = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'sRGB', 'gAMA', 'pHYs']);
   const forbiddenChunks = new Set(['caBX', 'eXIf', 'iCCP', 'iTXt', 'tEXt', 'zTXt']);
   const forbiddenMetadataText = ['ann-d', 'c:\\users', 'appdata', 'c2pa', 'jumbf', 'openai-media-service', 'urn:uuid', '-----begin'];
@@ -2122,6 +2131,34 @@ test('boundary documentation never describes incomplete evidence as a partial pa
     const document = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
     assert.doesNotMatch(document, /partial[^.\n]{0,50}\bpass\b/i);
   }
+});
+
+test('manual acceptance documentation matches skipped Doctor and the actual report dialog', () => {
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const faq = fs.readFileSync(new URL('../FAQ.md', import.meta.url), 'utf8');
+  const security = fs.readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
+  const changelog = fs.readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8');
+  const testPlan = fs.readFileSync(new URL('../docs/TEST_PLAN.md', import.meta.url), 'utf8');
+  const documents = [readme, faq, security, changelog, testPlan];
+
+  for (const document of documents) {
+    assert.match(document, /Doctor[^\n]*NOT_RUN|NOT_RUN[^\n]*Doctor/i);
+    assert.doesNotMatch(document, /codex doctor[^.\n]*(?:remains|is|as) (?:non-blocking )?read-only evidence/i);
+  }
+  assert.equal(readme.includes('The detailed text report opens automatically in Notepad.'), false);
+  assert.match(readme, /report dialog[^.]*does not open the detailed report automatically[^.]*press `O`/is);
+
+  const configurationSection = testPlan.slice(
+    testPlan.indexOf('## Test 1 – Configuration only'),
+    testPlan.indexOf('## Test 2 – Execpolicy coverage')
+  );
+  assert.match(configurationSection, /no Doctor question[^.]*NOT_RUN/is);
+  assert.match(configurationSection, /Notepad has not opened automatically\. Press `O`/i);
+  assert.doesNotMatch(configurationSection, /report opens in Notepad/i);
+  assert.equal(testPlan.includes('tested executable choice'), false);
+  assert.match(testPlan, /alternative executable list is inventory only/i);
+  assert.match(testPlan, /No Doctor question or executable-selection question may appear/i);
+  assert.match(testPlan, /same `O`\/`F`\/`M` report dialog/i);
 });
 
 test('declined live probes use a dedicated diagnostic and mode-specific coverage', () => {

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.0-alpha.12 – Unreleased
+
+### Added
+
+- Adds versioned, offline synthetic regression fixtures for `openai/codex#28457`, `openai/codex#36179`, `openai/codex#41135`, and `openai/codex#41278`, including affected-version metadata, expected states, and explicit evidence boundaries.
+- Reports execpolicy command form, exact rule-path binding, observed host resolution, and execution binding as separate facts in detailed and share-safe output.
+- Extends the configured Windows and Ubuntu CI matrix with Node.js 24 while retaining the declared Node.js 18 minimum and existing 18, 20, and 22 compatibility rows.
+
+### Changed
+
+- Requires the active inventory diagnostics or the explicitly selected alternative's own post-selection diagnostics to verify the same general `codex sandbox [OPTIONS] [COMMAND]...` contract used for any later live invocation.
+- Evaluates multiple known explicit execpolicy decisions independently of order with the strictest decision winning, while unknown values and unsupported structures remain fail-closed.
+- Binds helper and command-runner runtime evidence to the exact selected executable identity in addition to its component and runtime stage.
+- Retains the existing share-safe JSON `sandboxCommandSyntax` field as a compatibility alias while adding the semantically precise sandbox state and command-contract fields.
+- Removes implicit `codex doctor --json` execution from every Canary mode. Available CLIs report Doctor as `NOT_RUN`, unavailable CLIs as `UNAVAILABLE`, and no Doctor-derived diagnostics are claimed.
+- Aligns the manual acceptance plan with the actual report dialog and with Configuration-only inventory, which has no executable-selection step.
+- Restricts alternative executables to filesystem-only inventory until an explicit Guided or Sandbox-only selection is bound to one provable identity; only then may that executable run `--version` and `sandbox --help` diagnostics.
+- Labels package-derived alternative versions as metadata rather than executable output and keeps unselected alternatives `NOT_SELECTED`, `NOT_RUN`, and not tested across console and all report formats.
+- Rejects unparseable executed versions and package-metadata conflicts before `sandbox --help`, while preserving metadata-derived and execution-confirmed versions as separate report fields.
+- Documents the four per-run report artifacts plus the local `latest.json` management pointer, which contains absolute paths and is not share-safe.
+
+### Security
+
+- Preserves the complete structured `3/3` boundary matrix, smoke, host calibration, target-bound denial, structured cleanup, alternative-executable scoping, and share-safe redaction invariants.
+- Keeps package resources and any synthetic historical Doctor fixture evidence separate from helper resolution, runtime startup, and boundary proof; no fixture, help output, policy match, skipped diagnostic, or alternative executable can establish a PASS for the active CLI.
+- Limits the Canary's `auth.json` handling to an existence check and avoids Doctor-driven authentication, app, session, network, or update diagnostics.
+- Revalidates the explicit selection binding for classic and standalone alternatives before every Codex sandbox subprocess; aliases to the active executable are not run as independent candidates, while unproven identities fail closed.
+- Requires a stat-backed filesystem-object identity for selection, treats realpath-only evidence as unproven, and never labels a candidate as a tested bundle when identity validation blocks the first sandbox process.
+
+### Validation
+
+- Validated `npm test` with 210/210 passing tests on Windows and Node.js `v24.19.0`, including the focused alternative-inventory, wrapper-start, identity-binding, version-evidence, process-start, report-state, and upstream-fixture regressions; `npm run check` and `git diff --check` also completed successfully.
+- Completed a normal-user Windows live run with Canary `0.1.0-alpha.12` on Windows `10.0.26200` and Node.js `v24.19.0` against the active PATH CLI `codex-cli 0.151.0` (`ACTIVE_CLI`): resource layout `COMPLETE`, helper resolution `CONFIRMED`, runtime startup `READY`, and smoke `PASS`.
+- PowerShell, cmd.exe, and Node.js host calibration each passed; the complete boundary matrix was `3/3`, boundary `PASS`, and cleanup `COMPLETED`.
+- The preceding active PATH CLI `codex-cli 0.145.0` run stopped at `SANDBOX_SETUP_HELPER_NOT_RESOLVED` and produced no boundary verdict.
+- The PASS applies only to the tested Codex version, installation, configuration, and `:workspace` permission-profile run. Execpolicy coverage was separately `0/6`, additional rule coverage outside the boundary verdict. Two alternative executables were discovered but never selected or executed, and Codex doctor was not started.
+- No hosted CI matrix run was performed for this candidate.
+
+### Known limitations
+
+- The versioned offline fixtures for `openai/codex#28457`, `openai/codex#36179`, `openai/codex#41135`, and `openai/codex#41278` preserve known synthetic evidence boundaries; they do not prove a current live defect or a current live fix.
+- The Canary is local diagnostics, not a command blocker, automatic repair mechanism, general safety claim, or security certification.
+- Share-safe output reduces disclosure risk but guarantees neither anonymity nor secrecy and still requires manual review before sharing.
+
 ## 0.1.0-alpha.11 – 2026-08-01
 
 ### Added
@@ -16,7 +60,7 @@
 - Derives standalone aliases from normalized visible discovery paths, preserving `current` while excluding the representative direct release path consistently across Windows Node.js 18, 20, and 22.
 - Runs the complete operating-system and Node.js CI matrix without fail-fast cancellation so every supported combination reports its result.
 - Keeps the active PATH CLI and every separately selected executable as independent diagnostic targets across console, TXT, JSON, and share-safe reports; same-version and newer alternative results apply only to the selected executable.
-- Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result; `codex doctor --json` remains non-blocking read-only evidence.
+- Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result. Alpha 11 also invoked `codex doctor --json` during inventory; the unreleased candidate removes that implicit call instead of assuming a guaranteed local, offline, or read-only contract.
 - Writes full Sandbox-only reports when live probes are unavailable, while keeping unavailable, explicitly declined, and intentionally unassessed outcomes distinct.
 
 ### Security
