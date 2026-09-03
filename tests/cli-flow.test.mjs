@@ -61,7 +61,7 @@ function makeInventory(scenario, appRoot) {
     'multi-sandbox-all-newer-select',
     'multi-sandbox-all-skip',
   ]);
-  const activeComplete = multipleCandidateScenario || ['guided-live-run', 'sandbox-continue-decline', 'sandbox-live-run', 'sandbox-incomplete-error', 'sandbox-gap-with-errors', 'sandbox-cleanup-failure'].includes(scenario);
+  const activeComplete = multipleCandidateScenario || ['guided-live-run', 'sandbox-continue-decline', 'sandbox-live-run', 'sandbox-missing-smoke-evidence', 'sandbox-incomplete-error', 'sandbox-gap-with-errors', 'sandbox-cleanup-failure'].includes(scenario);
   const activeStandalone = [
     'runner-process-failure',
     'inventory-runner-help-failure',
@@ -216,11 +216,30 @@ function syntheticBoundaryProbe({ method, location, label, command, expected, ob
     operationAttempted: true,
     hostCalibrationStatus: 'PASS',
     targetIdentityStatus: 'MATCHED',
+    targetIdentityMatched: true,
     errorTargetMatched: location === 'outside' && assessment === 'PASS',
     fileExistedBefore: true,
     fileExistsAfter: retained,
     unrelatedFailureDetected: false,
   };
+}
+
+const SYNTHETIC_BOUNDARY_RUN_MARKER = 'synthetic-cli-boundary-run';
+
+function bindSyntheticBoundaryProcessEvidence(probes, codexExecutableIdentity) {
+  return probes.map((probe) => {
+    const method = probe.method === 'cmd.exe' ? 'cmd' : probe.method === 'node.js' ? 'node' : probe.method;
+    const id = `${probe.location}-workspace-${method}`;
+    return {
+      ...probe,
+      id,
+      targetId: id,
+      reportedRuntime: method,
+      codexProcessStarted: true,
+      runMarker: SYNTHETIC_BOUNDARY_RUN_MARKER,
+      codexExecutableIdentity,
+    };
+  });
 }
 
 function syntheticHostCalibrations() {
@@ -243,14 +262,21 @@ function syntheticSandboxResult(options, appRoot, scenario) {
     codexExecutableIdentity: options.codexSource === 'ACTIVE_CLI' ? 'synthetic-active-cli' : 'synthetic-tested-bundle',
     sandboxCommandSyntax: options.sandboxCommandContract?.syntax || 'UNKNOWN',
   };
+  if (scenario === 'sandbox-missing-smoke-evidence') {
+    const completed = syntheticSandboxResult(options, appRoot, 'sandbox-live-run');
+    delete completed.smoke;
+    return completed;
+  }
   if (['runner-process-failure', 'targeted-dual-failure'].includes(scenario)) {
     return {
       status: 'SETUP_FAILED',
       ...targetMetadata,
+      codexProcessStarted: false,
+      marker: SYNTHETIC_BOUNDARY_RUN_MARKER,
       permissionProfile: ':workspace',
       hostCalibrations: syntheticHostCalibrations(),
       layout: { runDir: path.join(appRoot, 'runs', `synthetic-${Date.now()}`) },
-      smoke: { passed: false, commandExitCode: 1, setupFailure: true, stderr: 'codex-command-runner.exe CreateProcessWithLogonW failed: 2' },
+      smoke: { passed: false, commandExitCode: 1, setupFailure: true, codexProcessStarted: true, stderr: 'codex-command-runner.exe CreateProcessWithLogonW failed: 2' },
       probes: [],
       runtimeEvidence: buildSandboxRuntimeEvidence('codex-command-runner.exe CreateProcessWithLogonW failed: 2', {
         step: 'SANDBOX_SMOKE', codexSource: targetMetadata.codexSource,
@@ -263,15 +289,17 @@ function syntheticSandboxResult(options, appRoot, scenario) {
     return {
       status: 'ERROR',
       ...targetMetadata,
+      codexProcessStarted: false,
+      marker: SYNTHETIC_BOUNDARY_RUN_MARKER,
       permissionProfile: ':workspace',
       layout: { runDir: path.join(appRoot, 'runs', `synthetic-${Date.now()}`) },
       hostPreflight: { passed: true, filesChecked: 2 },
       hostCalibrations: syntheticHostCalibrations(),
-      smoke: { passed: true, commandExitCode: 0, setupFailure: false, stderr: '' },
-      probes: [
+      smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
+      probes: bindSyntheticBoundaryProcessEvidence([
         syntheticBoundaryProbe({ method: 'powershell', location: 'inside', label: 'PowerShell synthetic inside workspace', command: ['powershell', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
         syntheticBoundaryProbe({ method: 'powershell', location: 'outside', label: 'PowerShell synthetic outside workspace', command: ['powershell', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
-      ],
+      ], targetMetadata.codexExecutableIdentity),
       error: 'Synthetic interruption after the PowerShell runtime pair.',
     };
   }
@@ -279,19 +307,21 @@ function syntheticSandboxResult(options, appRoot, scenario) {
     return {
       status: 'ERROR',
       ...targetMetadata,
+      codexProcessStarted: false,
+      marker: SYNTHETIC_BOUNDARY_RUN_MARKER,
       permissionProfile: ':workspace',
       layout: { runDir: path.join(appRoot, 'runs', `synthetic-${Date.now()}`) },
       hostPreflight: { passed: true, filesChecked: 2 },
       hostCalibrations: syntheticHostCalibrations(),
-      smoke: { passed: true, commandExitCode: 0, setupFailure: false, stderr: '' },
-      probes: [
+      smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
+      probes: bindSyntheticBoundaryProcessEvidence([
         syntheticBoundaryProbe({ method: 'powershell', location: 'inside', label: 'PowerShell synthetic inside workspace', command: ['powershell', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
         syntheticBoundaryProbe({ method: 'powershell', location: 'outside', label: 'PowerShell synthetic outside workspace', command: ['powershell', 'outside'], expected: 'RETAINED', observed: 'DELETED', assessment: 'CRITICAL_GAP' }),
         syntheticBoundaryProbe({ method: 'cmd.exe', location: 'inside', label: 'cmd.exe synthetic inside workspace', command: ['cmd.exe', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
         syntheticBoundaryProbe({ method: 'cmd.exe', location: 'outside', label: 'cmd.exe synthetic outside workspace', command: ['cmd.exe', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'TEST_ERROR' }),
         syntheticBoundaryProbe({ method: 'node.js', location: 'inside', label: 'Node.js synthetic inside workspace', command: ['node', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
         syntheticBoundaryProbe({ method: 'node.js', location: 'outside', label: 'Node.js synthetic outside workspace', command: ['node', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
-      ],
+      ], targetMetadata.codexExecutableIdentity),
       error: 'Synthetic sibling probe failure after a confirmed outside deletion.',
     };
   }
@@ -299,19 +329,20 @@ function syntheticSandboxResult(options, appRoot, scenario) {
     status: 'COMPLETED',
     ...targetMetadata,
     codexProcessStarted: true,
+    marker: SYNTHETIC_BOUNDARY_RUN_MARKER,
     permissionProfile: ':workspace',
     layout: { runDir: path.join(appRoot, 'runs', `synthetic-${Date.now()}`) },
     hostPreflight: { passed: true, filesChecked: 2 },
     hostCalibrations: syntheticHostCalibrations(),
     smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
-    probes: [
+    probes: bindSyntheticBoundaryProcessEvidence([
       syntheticBoundaryProbe({ method: 'powershell', location: 'inside', label: 'PowerShell synthetic inside workspace', command: ['powershell', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
       syntheticBoundaryProbe({ method: 'powershell', location: 'outside', label: 'PowerShell synthetic outside workspace', command: ['powershell', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
       syntheticBoundaryProbe({ method: 'cmd.exe', location: 'inside', label: 'cmd.exe synthetic inside workspace', command: ['cmd.exe', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
       syntheticBoundaryProbe({ method: 'cmd.exe', location: 'outside', label: 'cmd.exe synthetic outside workspace', command: ['cmd.exe', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
       syntheticBoundaryProbe({ method: 'node.js', location: 'inside', label: 'Node.js synthetic inside workspace', command: ['node', 'inside'], expected: 'DELETED', observed: 'DELETED', assessment: 'EXPECTED' }),
       syntheticBoundaryProbe({ method: 'node.js', location: 'outside', label: 'Node.js synthetic outside workspace', command: ['node', 'outside'], expected: 'RETAINED', observed: 'RETAINED', assessment: 'PASS' }),
-    ],
+    ], targetMetadata.codexExecutableIdentity),
   };
 }
 
@@ -444,6 +475,21 @@ test('configuration, execpolicy, guided, and sandbox-only keep Doctor skipped wi
   }
 });
 
+test('Guided introduction discloses active CLI diagnostics before inventory and preserves consent boundaries', async (t) => {
+  const { stdout, localAppData, alternativeDiagnosticCount } = await runCliScenario(t, 'guided-alt-decline', '1\nn\nm\n0\n');
+  const disclosureIndex = stdout.indexOf('For inventory, the Canary invokes the active PATH CLI with the intended non-modifying diagnostics --version and sandbox --help.');
+  const inventoryIndex = stdout.indexOf('Windows:');
+  assert.ok(disclosureIndex >= 0);
+  assert.ok(inventoryIndex > disclosureIndex);
+  assert.match(stdout, /This assessment never reads or modifies real project files\./);
+  assert.match(stdout, /inventories Codex installation and resource metadata.*may read selected Codex settings and user-level rule files.*does not read credential contents/i);
+  assert.match(stdout, /Codex doctor stays off, and no alternative executable starts unless you select it\./);
+  assert.match(stdout, /Optional live probes use disposable synthetic files under:/);
+  assert.ok(stdout.includes(path.join(localAppData, 'CodexSafetyCanary', 'runs')));
+  assert.match(stdout, /does not call a model or run a sandbox deletion probe without later explicit consent/i);
+  assert.equal(alternativeDiagnosticCount, 0);
+});
+
 test('CLI guided assessment reports declined boundary when alternative bundle is rejected', async (t) => {
   const { stdout, report, alternativeDiagnosticCount } = await runCliScenario(t, 'guided-alt-decline', '1\nn\nm\n0\n');
   assertReturnedToMenuAfterReport(stdout);
@@ -557,11 +603,36 @@ test('CLI sandbox-only live-probe success path keeps syntax and smoke consistent
   assert.equal(supportJson.environment.sandboxCommandSyntax, supportJson.environment.sandboxCommandState);
   assert.equal(supportJson.environment.sandboxCommandContract, 'GENERIC_PERMISSION_PROFILE');
   assert.equal(supportJson.sandbox.commandSyntax, 'GENERIC_PERMISSION_PROFILE');
+  assert.equal(supportJson.sandbox.codexProcessStarted, true);
   assert.equal(supportJson.sandbox.smoke.passed, true);
+  assert.equal(supportJson.sandbox.smoke.codexProcessStarted, true);
+  assert.equal(supportJson.sandbox.probes.length, 6);
+  assert.equal(supportJson.sandbox.probes.every((probe) => probe.codexProcessStarted === true), true);
   for (const output of [stdout, detailText, supportText]) {
     assert.match(output, /Runtime smoke test:\s+PASS/);
+    assert.match(output, /Boundary probe process-start evidence:\s+6\/6 CONFIRMED; aggregate:\s+CONFIRMED/);
     assert.match(output, /Sandbox syntax (?:contract|used):\s+GENERIC_PERMISSION_PROFILE/);
   }
+});
+
+test('CLI and reports show missing smoke evidence as NOT REPORTED, never as no', async (t) => {
+  const { stdout, report, localAppData } = await runCliScenario(t, 'sandbox-missing-smoke-evidence', '4\ny\nm\n0\n');
+  const detailJson = latestDetailJson(localAppData);
+  const detailText = fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('.txt') && !name.endsWith('-support.txt')), 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('-support.json')), 'utf8'));
+  const supportText = fs.readFileSync(latestReportFile(localAppData, (name) => name.endsWith('-support.txt')), 'utf8');
+
+  for (const text of [stdout, detailText, supportText]) {
+    assert.match(text, /Runtime smoke test:\s+NOT RUN; process-start evidence:\s+NOT REPORTED/);
+    assert.doesNotMatch(text, /Runtime smoke test:\s+NOT RUN; Codex process started:\s+no/i);
+    assert.match(text, /Boundary probe process-start evidence:\s+6\/6 CONFIRMED; aggregate:\s+CONFIRMED/);
+  }
+  for (const json of [detailJson, supportJson]) {
+    assert.equal(json.sandbox.smokeStatus, 'NOT RUN');
+    assert.equal(json.sandbox.smokeProcessStartEvidence, 'NOT REPORTED');
+  }
+  assert.equal(report.summary.boundary, 'TEST ERROR');
+  assert.notEqual(report.summary.overall, 'BOUNDARY TEST PASSED');
 });
 
 test('CLI Guided Assessment lets the user select a same-version alternative explicitly', async (t) => {

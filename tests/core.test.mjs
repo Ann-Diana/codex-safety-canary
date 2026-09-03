@@ -55,7 +55,15 @@ import {
   buildPowerShellDeleteCommand,
   runHostDeletionPreflight,
   runMethodHostCalibrations,
+  runSandboxCommand,
   runSandboxProbes,
+  boundaryProbeProcessMarkersAreComplete,
+  boundaryProbeProcessStartEvidence,
+  formatBoundaryProbeProcessStartEvidence,
+  formatSmokeProcessStartEvidence,
+  processStartEvidenceStatus,
+  createBoundaryProbeRecord,
+  finalizeSandboxProbeRun,
   validateStandaloneResourceBinding,
   validateSelectedExecutableBinding,
   buildSupportPayload,
@@ -77,6 +85,7 @@ const TEST_SANDBOX_COMMAND_CONTRACT = Object.freeze({
 });
 const ACTIVE_EXECUTABLE_IDENTITY = 'synthetic-active-cli-identity';
 const TESTED_EXECUTABLE_IDENTITY = 'synthetic-tested-bundle-identity';
+const TEST_RUN_MARKER = 'synthetic-boundary-run-marker';
 
 function filesystemAlternative(executablePath, derivedVersion = null, extra = {}) {
   return {
@@ -102,20 +111,28 @@ function completeBoundaryProbes({ gapMethod = null } = {}) {
     const gap = method === gapMethod;
     return [
     {
-      method, location: 'inside', assessment: 'EXPECTED', observed: 'DELETED', targetId: insideId,
+      id: insideId, method, reportedRuntime: method, location: 'inside', assessment: 'EXPECTED', observed: 'DELETED', targetId: insideId,
+      codexProcessStarted: true, runMarker: TEST_RUN_MARKER, codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
       commandStarted: true, operationAttempted: true, hostCalibrationStatus: 'PASS', targetIdentityStatus: 'MATCHED', errorTargetMatched: false,
+      targetIdentityMatched: true,
       fileExistedBefore: true, fileExistsAfter: false, unrelatedFailureDetected: false,
     },
     {
+      id: outsideId,
       method,
+      reportedRuntime: method,
       location: 'outside',
       assessment: gap ? 'CRITICAL_GAP' : 'PASS',
       observed: gap ? 'DELETED' : 'RETAINED',
       targetId: outsideId,
+      codexProcessStarted: true,
+      runMarker: TEST_RUN_MARKER,
+      codexExecutableIdentity: ACTIVE_EXECUTABLE_IDENTITY,
       commandStarted: true,
       operationAttempted: true,
       hostCalibrationStatus: 'PASS',
       targetIdentityStatus: 'MATCHED',
+      targetIdentityMatched: true,
       errorTargetMatched: !gap,
       fileExistedBefore: true,
       fileExistsAfter: !gap,
@@ -126,19 +143,90 @@ function completeBoundaryProbes({ gapMethod = null } = {}) {
 }
 
 function completedBoundarySandbox(overrides = {}) {
+  const {
+    marker = TEST_RUN_MARKER,
+    codexExecutableIdentity = ACTIVE_EXECUTABLE_IDENTITY,
+    probes: suppliedProbes = completeBoundaryProbes(),
+    ...remainingOverrides
+  } = overrides;
+  const probes = suppliedProbes.map((probe) => {
+    const method = probe.method === 'cmd.exe' ? 'cmd' : probe.method === 'node.js' ? 'node' : probe.method;
+    const id = `${probe.location}-workspace-${method}`;
+    return {
+      id,
+      targetId: id,
+      reportedRuntime: method,
+      codexProcessStarted: true,
+      runMarker: marker,
+      codexExecutableIdentity,
+      ...probe,
+    };
+  });
   return {
     status: 'COMPLETED',
     codexSource: 'ACTIVE_CLI',
     codexProcessStarted: true,
+    marker,
+    codexExecutableIdentity,
     hostPreflight: { passed: true, filesChecked: 2 },
     hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
     smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
-    probes: completeBoundaryProbes(),
+    probes,
     cleanup: {
       status: 'COMPLETED', attempted: true, completed: true, errorPresent: false,
       message: 'Disposable run folder removed before final reports were written.',
     },
+    ...remainingOverrides,
+  };
+}
+
+function producerBoundarySandbox(overrides = {}) {
+  const marker = overrides.marker || TEST_RUN_MARKER;
+  const codexExecutableIdentity = overrides.codexExecutableIdentity || ACTIVE_EXECUTABLE_IDENTITY;
+  const probes = ['powershell', 'cmd', 'node'].flatMap((method) => ['inside', 'outside'].map((location) => {
+    const id = `${location}-workspace-${method}`;
+    const classification = classifyStructuredProbe(method, location);
+    return createBoundaryProbeRecord({
+      definition: {
+        id,
+        label: `${method} synthetic ${location}`,
+        method,
+        location,
+        file: `C:\\Canary\\${method}-${location}.txt`,
+        meaning: 'Synthetic producer-to-consumer process evidence.',
+      },
+      method,
+      expected: location === 'inside' ? 'DELETED' : 'RETAINED',
+      after: location === 'outside',
+      result: { status: classification.exitCode, stdout: '', stderr: '', codexProcessStarted: true },
+      classification,
+      runMarker: marker,
+      codexExecutableIdentity,
+    });
+  }));
+  return finalizeSandboxProbeRun({
+    status: 'COMPLETED',
+    codexSource: 'ACTIVE_CLI',
+    marker,
+    codexExecutableIdentity,
+    hostPreflight: { passed: true, filesChecked: 2 },
+    hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, status: 'PASS', passed: true })),
+    smoke: { passed: true, commandExitCode: 0, setupFailure: false, codexProcessStarted: true, stderr: '' },
+    probes,
+    cleanup: { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false },
     ...overrides,
+  });
+}
+
+function syntheticReportInventory() {
+  return {
+    platform: 'win32', release: 'synthetic', nodeVersion: process.version, nodeRuntimeSource: 'TEST',
+    nodeInPath: true, npmInPath: true, elevated: false, codexInstalled: true,
+    codexVersion: 'codex-cli synthetic', activeCodexPath: null,
+    activeBundle: { complete: true, installType: 'classic', resourceLayout: 'COMPLETE', missing: [] },
+    matchingCompleteBundles: [], newerCompleteBundles: [], standalonePackages: [],
+    codexHome: 'synthetic', authFilePresent: false, ruleFiles: [], sandboxWindowsState: 'AVAILABLE', sandboxHelpError: null,
+    config: { exists: false, path: 'synthetic', sandboxMode: null, approvalPolicy: null, defaultPermissions: null, windowsSandbox: null, networkAccess: null, warnings: [] },
   };
 }
 
@@ -925,6 +1013,138 @@ test('Node EPERM with a namespace error target matches the controlled outside fi
   assert.equal(result.assessment, 'PASS');
 });
 
+test('structured probe runtime must match the declared boundary method', () => {
+  const targetPath = 'C:\\Canary\\powershell-outside.txt';
+  const definition = { id: 'outside-workspace-powershell', file: targetPath, expected: 'RETAINED', location: 'outside', method: 'powershell' };
+  const result = classifySandboxProbe({
+    before: true,
+    after: true,
+    definition,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    result: structuredProbeResult({
+      runtime: 'cmd', targetId: definition.id, targetPath: null, status: 1, succeeded: false,
+      targetState: 'RETAINED', operationOutput: 'Access is denied.',
+    }),
+  });
+  assert.equal(result.runtimeIdentityMatched, false);
+  assert.equal(result.targetIdentityMatched, false);
+  assert.equal(result.assessment, 'TEST_ERROR');
+});
+
+test('producer preserves a mismatched child target identity and fails the process-marker aggregate closed', (t) => {
+  const targetPath = 'C:\\Canary\\powershell-inside.txt';
+  const definition = {
+    id: 'inside-workspace-powershell', file: targetPath, expected: 'DELETED', location: 'inside', method: 'powershell',
+    label: 'PowerShell synthetic inside workspace', meaning: 'Synthetic target identity mismatch.',
+  };
+  const result = {
+    ...structuredProbeResult({
+      runtime: 'powershell', targetId: 'inside-workspace-cmd', targetPath,
+      status: 0, succeeded: true, targetState: 'DELETED',
+    }),
+    codexProcessStarted: true,
+  };
+  const classification = classifySandboxProbe({
+    before: true, after: false, definition, result,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+  });
+  const sandbox = producerBoundarySandbox();
+  sandbox.probes[0] = createBoundaryProbeRecord({
+    definition, method: 'powershell', expected: 'DELETED', after: false, result, classification,
+    runMarker: sandbox.marker, codexExecutableIdentity: sandbox.codexExecutableIdentity,
+  });
+  const finalized = finalizeSandboxProbeRun(sandbox);
+
+  assert.equal(classification.targetIdentityMatched, false);
+  assert.equal(finalized.probes[0].targetId, 'inside-workspace-cmd');
+  assert.equal(finalized.probes[0].reportedTargetPath, targetPath);
+  assert.equal(finalized.codexProcessStarted, false);
+  assert.equal(boundaryProbeProcessMarkersAreComplete(finalized), false);
+  assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], finalized).boundary, 'TEST ERROR');
+
+  const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-target-id-report-'));
+  t.after(() => fs.rmSync(appRoot, { recursive: true, force: true }));
+  const written = writeReport({ inventory: syntheticReportInventory(), sandbox: finalized, appRoot, assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  const detailJson = JSON.parse(fs.readFileSync(written.jsonPath, 'utf8'));
+  const detailText = fs.readFileSync(written.txtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(written.supportJsonPath, 'utf8'));
+  const supportText = fs.readFileSync(written.supportTxtPath, 'utf8');
+  assert.equal(detailJson.sandbox.probes[0].targetId, 'inside-workspace-cmd');
+  assert.equal(detailJson.sandbox.probes[0].reportedTargetPath, targetPath);
+  assert.equal(supportJson.sandbox.probes[0].targetId, 'inside-workspace-cmd');
+  assert.equal(supportJson.sandbox.probes[0].targetIdentityMatched, false);
+  assert.equal(supportJson.sandbox.codexProcessStarted, false);
+  assert.match(detailText, /Target ID:\s+inside-workspace-cmd/);
+  assert.match(detailText, /Child-reported target path:\s+C:\\Canary\\powershell-inside\.txt/);
+  assert.match(supportText, /Target ID:\s+inside-workspace-cmd; target identity matched:\s+no/);
+  assert.match(supportText, /Boundary probe process-start evidence:\s+6\/6 CONFIRMED; aggregate:\s+NOT CONFIRMED/);
+
+  for (const reportedTargetId of ['', null]) {
+    const missingIdResult = {
+      ...structuredProbeResult({
+        runtime: 'powershell', targetId: reportedTargetId, targetPath,
+        status: 0, succeeded: true, targetState: 'DELETED',
+      }),
+      codexProcessStarted: true,
+    };
+    const missingIdClassification = classifySandboxProbe({
+      before: true, after: false, definition, result: missingIdResult,
+      hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+    });
+    const missingIdSandbox = producerBoundarySandbox();
+    missingIdSandbox.probes[0] = createBoundaryProbeRecord({
+      definition, method: 'powershell', expected: 'DELETED', after: false,
+      result: missingIdResult, classification: missingIdClassification,
+      runMarker: missingIdSandbox.marker, codexExecutableIdentity: missingIdSandbox.codexExecutableIdentity,
+    });
+    const missingIdFinalized = finalizeSandboxProbeRun(missingIdSandbox);
+    assert.equal(missingIdFinalized.probes[0].targetId, reportedTargetId);
+    assert.equal(missingIdFinalized.codexProcessStarted, false);
+  }
+
+  const wrongPath = 'C:\\Canary\\different-target.txt';
+  const wrongPathResult = {
+    ...structuredProbeResult({
+      runtime: 'powershell', targetId: definition.id, targetPath: wrongPath,
+      status: 0, succeeded: true, targetState: 'DELETED',
+    }),
+    codexProcessStarted: true,
+  };
+  const wrongPathClassification = classifySandboxProbe({
+    before: true, after: false, definition, result: wrongPathResult,
+    hostCalibration: { method: 'powershell', status: 'PASS', passed: true },
+  });
+  const wrongPathSandbox = producerBoundarySandbox();
+  wrongPathSandbox.probes[0] = createBoundaryProbeRecord({
+    definition, method: 'powershell', expected: 'DELETED', after: false,
+    result: wrongPathResult, classification: wrongPathClassification,
+    runMarker: wrongPathSandbox.marker, codexExecutableIdentity: wrongPathSandbox.codexExecutableIdentity,
+  });
+  const wrongPathFinalized = finalizeSandboxProbeRun(wrongPathSandbox);
+  assert.equal(wrongPathFinalized.probes[0].reportedTargetPath, wrongPath);
+  assert.equal(wrongPathFinalized.probes[0].targetIdentityMatched, false);
+  assert.equal(wrongPathFinalized.codexProcessStarted, false);
+});
+
+test('cmd target-path evidence accepts only nullish absence or a matching nonempty string', () => {
+  const targetPath = 'C:\\Canary\\cmd-inside.txt';
+  const definition = { id: 'inside-workspace-cmd', file: targetPath, expected: 'DELETED', location: 'inside', method: 'cmd' };
+  for (const reportedTargetPath of [false, 0, '', { path: targetPath }]) {
+    const result = classifySandboxProbe({
+      before: true,
+      after: false,
+      definition,
+      result: structuredProbeResult({
+        runtime: 'cmd', targetId: definition.id, targetPath: reportedTargetPath,
+        status: 0, succeeded: true, targetState: 'DELETED', operationOutput: 'synthetic',
+      }),
+      hostCalibration: { method: 'cmd', status: 'PASS', passed: true },
+    });
+    assert.equal(result.targetIdentityMatched, false, JSON.stringify(reportedTargetPath));
+    assert.equal(result.assessment, 'TEST_ERROR', JSON.stringify(reportedTargetPath));
+  }
+});
+
 test('retained outside file passes only with structured target-related access evidence', () => {
   const targetPath = 'C:\\Canary\\outside-node.txt';
   const definition = { id: 'outside-workspace-node', file: targetPath, expected: 'RETAINED', location: 'outside' };
@@ -1233,6 +1453,290 @@ test('boundary pass requires explicit Codex process-start evidence', () => {
   assert.notEqual(summary.overall, 'BOUNDARY TEST PASSED');
 });
 
+test('producer preserves six identity-bound process markers and the consumer accepts the complete set', () => {
+  const sandbox = producerBoundarySandbox();
+  assert.equal(sandbox.probes.length, 6);
+  assert.equal(boundaryProbeProcessMarkersAreComplete(sandbox), true);
+  assert.equal(sandbox.codexProcessStarted, true);
+  for (const probe of sandbox.probes) {
+    assert.equal(probe.codexProcessStarted, true);
+    assert.equal(probe.runMarker, sandbox.marker);
+    assert.equal(probe.codexExecutableIdentity, sandbox.codexExecutableIdentity);
+    assert.equal(probe.id, probe.targetId);
+    assert.equal(probe.reportedRuntime, probe.method);
+  }
+  const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+  assert.equal(summary.overall, 'BOUNDARY TEST PASSED');
+  assert.equal(summary.boundary, 'PASS');
+  assert.equal(summary.methodCoverage, '3/3');
+});
+
+test('each individually missing boundary process marker fails closed', () => {
+  for (let index = 0; index < 6; index += 1) {
+    const sandbox = producerBoundarySandbox();
+    delete sandbox.probes[index].codexProcessStarted;
+    sandbox.codexProcessStarted = true;
+    const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+    assert.equal(boundaryProbeProcessMarkersAreComplete(sandbox), false, `probe ${index}`);
+    assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE', `probe ${index}`);
+    assert.equal(summary.boundary, 'TEST ERROR', `probe ${index}`);
+  }
+});
+
+test('false null string and unknown boundary marker values fail closed', () => {
+  for (const value of [false, null, 'true', 'UNKNOWN', { value: true }]) {
+    const sandbox = producerBoundarySandbox();
+    sandbox.probes[0].codexProcessStarted = value;
+    sandbox.codexProcessStarted = true;
+    const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+    assert.equal(boundaryProbeProcessMarkersAreComplete(sandbox), false, String(value));
+    assert.equal(summary.boundary, 'TEST ERROR', String(value));
+  }
+});
+
+test('duplicate missing and wrongly assigned matrix identities fail closed', () => {
+  const cases = [];
+  const duplicate = producerBoundarySandbox();
+  duplicate.probes[5] = { ...duplicate.probes[4] };
+  duplicate.codexProcessStarted = true;
+  cases.push(['duplicate', duplicate]);
+
+  const missing = producerBoundarySandbox();
+  missing.probes.pop();
+  missing.codexProcessStarted = true;
+  cases.push(['missing', missing]);
+
+  const wrongMethod = producerBoundarySandbox();
+  wrongMethod.probes[0].method = 'ruby';
+  wrongMethod.codexProcessStarted = true;
+  cases.push(['wrong method', wrongMethod]);
+
+  const wrongLocation = producerBoundarySandbox();
+  wrongLocation.probes[0].location = 'control';
+  wrongLocation.codexProcessStarted = true;
+  cases.push(['wrong location', wrongLocation]);
+
+  const wrongRuntime = producerBoundarySandbox();
+  wrongRuntime.probes[0].reportedRuntime = 'cmd';
+  wrongRuntime.codexProcessStarted = true;
+  cases.push(['wrong child runtime', wrongRuntime]);
+
+  const wrongRun = producerBoundarySandbox();
+  wrongRun.probes[0].runMarker = 'different-run';
+  wrongRun.codexProcessStarted = true;
+  cases.push(['wrong run', wrongRun]);
+
+  const wrongExecutable = producerBoundarySandbox();
+  wrongExecutable.probes[0].codexExecutableIdentity = 'different-executable';
+  wrongExecutable.codexProcessStarted = true;
+  cases.push(['wrong executable', wrongExecutable]);
+
+  for (const [label, sandbox] of cases) {
+    const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+    assert.equal(boundaryProbeProcessMarkersAreComplete(sandbox), false, label);
+    assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE', label);
+    assert.equal(summary.boundary, 'TEST ERROR', label);
+  }
+});
+
+test('aggregate and smoke contradictions remain fail closed', () => {
+  const aggregateFalse = producerBoundarySandbox();
+  aggregateFalse.codexProcessStarted = false;
+  assert.equal(boundaryProbeProcessMarkersAreComplete(aggregateFalse), true);
+  assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], aggregateFalse).boundary, 'TEST ERROR');
+
+  for (const smokeMarker of [undefined, false, null, 'true']) {
+    const sandbox = producerBoundarySandbox();
+    if (smokeMarker === undefined) delete sandbox.smoke.codexProcessStarted;
+    else sandbox.smoke.codexProcessStarted = smokeMarker;
+    assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], sandbox).boundary, 'TEST ERROR', String(smokeMarker));
+  }
+});
+
+test('spawn failure and catch finalization never assert aggregate process start', () => {
+  const spawnFailure = producerBoundarySandbox();
+  spawnFailure.probes[2].codexProcessStarted = false;
+  const failedRun = finalizeSandboxProbeRun({ ...spawnFailure, codexProcessStarted: true });
+  assert.equal(failedRun.codexProcessStarted, false);
+  assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], failedRun).boundary, 'TEST ERROR');
+
+  const partialRun = producerBoundarySandbox();
+  const caught = finalizeSandboxProbeRun({ ...partialRun, status: 'ERROR', probes: partialRun.probes.slice(0, 5), error: 'synthetic catch' });
+  assert.equal(caught.codexProcessStarted, false);
+  assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], caught).boundary, 'TEST ERROR');
+
+  const caughtAfterSix = finalizeSandboxProbeRun({ ...producerBoundarySandbox(), status: 'ERROR', error: 'synthetic catch after matrix' });
+  assert.equal(caughtAfterSix.codexProcessStarted, false);
+  assert.equal(summarizeAssessment({ config: { warnings: [] } }, [], caughtAfterSix).boundary, 'TEST ERROR');
+});
+
+test('active CLI run binding is revalidated before every sandbox command', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-active-run-binding-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const executable = path.join(root, 'codex.exe');
+  fs.writeFileSync(executable, 'synthetic active executable');
+  const plan = selectCodexProbePlan({
+    activeCodexPath: executable,
+    codexVersion: 'codex-cli synthetic',
+    activeBundle: { probeEligible: true, installType: 'classic', resourceLayout: 'COMPLETE' },
+    sandboxHelperInPath: false,
+    sandboxWindowsState: 'AVAILABLE',
+    sandboxCommandContract: TEST_SANDBOX_COMMAND_CONTRACT,
+    alternativeExecutables: [],
+  });
+  assert.equal(validateSelectedExecutableBinding(plan.executableRunBinding, executable).valid, true);
+
+  let invocations = 0;
+  const first = runSandboxCommand(['cmd.exe', '/d', '/c', 'echo', 'synthetic'], root, {
+    codexExe: executable,
+    executableRunBinding: plan.executableRunBinding,
+    commandContract: TEST_SANDBOX_COMMAND_CONTRACT,
+    invokeCodex() {
+      invocations += 1;
+      fs.renameSync(executable, `${executable}.old`);
+      fs.writeFileSync(executable, 'replacement active executable');
+      return { status: 0, stdout: 'synthetic', stderr: '', codexProcessStarted: true };
+    },
+  });
+  const second = runSandboxCommand(['cmd.exe', '/d', '/c', 'echo', 'synthetic'], root, {
+    codexExe: executable,
+    executableRunBinding: plan.executableRunBinding,
+    commandContract: TEST_SANDBOX_COMMAND_CONTRACT,
+    invokeCodex() {
+      invocations += 1;
+      return { status: 0, stdout: 'unexpected', stderr: '', codexProcessStarted: true };
+    },
+  });
+
+  assert.equal(first.codexProcessStarted, true);
+  assert.equal(second.codexProcessStarted, false);
+  assert.equal(second.status, null);
+  assert.match(second.error.message, /identity changed/i);
+  assert.equal(invocations, 1);
+});
+
+test('detail replay and all report channels retain consistent process-start evidence', (t) => {
+  const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-process-marker-report-'));
+  t.after(() => fs.rmSync(appRoot, { recursive: true, force: true }));
+  const sandbox = producerBoundarySandbox();
+  const written = writeReport({ inventory: syntheticReportInventory(), sandbox, appRoot, assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY });
+  const detailJson = JSON.parse(fs.readFileSync(written.jsonPath, 'utf8'));
+  const detailText = fs.readFileSync(written.txtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(written.supportJsonPath, 'utf8'));
+  const supportText = fs.readFileSync(written.supportTxtPath, 'utf8');
+
+  assert.equal(detailJson.sandbox.probes.length, 6);
+  assert.equal(detailJson.sandbox.probes.every((probe) => probe.codexProcessStarted === true), true);
+  assert.equal(detailJson.sandbox.probes.every((probe) => probe.runMarker === detailJson.sandbox.marker), true);
+  assert.equal(detailJson.sandbox.probes.every((probe) => probe.codexExecutableIdentity === detailJson.sandbox.codexExecutableIdentity), true);
+  const replay = summarizeAssessment(detailJson.inventory, detailJson.execpolicy, detailJson.sandbox, { assessmentMode: detailJson.assessmentMode });
+  assert.equal(replay.boundary, 'PASS');
+
+  assert.equal(supportJson.sandbox.codexProcessStarted, true);
+  assert.equal(supportJson.sandbox.processStartEvidence, 'CONFIRMED');
+  assert.deepEqual(supportJson.sandbox.boundaryProbeProcessStartEvidence, {
+    expectedCount: 6, confirmedCount: 6, aggregate: 'CONFIRMED',
+  });
+  assert.equal(supportJson.sandbox.smoke.codexProcessStarted, true);
+  assert.equal(supportJson.sandbox.smoke.processStartEvidence, 'CONFIRMED');
+  assert.equal(supportJson.sandbox.probes.length, 6);
+  assert.equal(supportJson.sandbox.probes.every((probe) => probe.codexProcessStarted === true), true);
+  assert.equal(JSON.stringify(supportJson).includes(TEST_RUN_MARKER), false);
+  assert.equal(JSON.stringify(supportJson).includes(ACTIVE_EXECUTABLE_IDENTITY), false);
+  for (const text of [detailText, supportText]) {
+    assert.match(text, /Boundary probe process-start evidence:\s+6\/6 CONFIRMED; aggregate:\s+CONFIRMED/);
+    assert.equal((text.match(/Process-start evidence:\s+CONFIRMED/g) || []).length, 6);
+    assert.match(text, /Runtime smoke test:\s+PASS; process-start evidence:\s+CONFIRMED/);
+    assert.match(text, /Sandbox boundary:\s+PASS|Active CLI boundary:\s+PASS/);
+  }
+});
+
+test('process-start evidence uses the same three states in detail and share-safe reports', (t) => {
+  const cases = [
+    ['true', true, 'CONFIRMED', true, 6],
+    ['false', false, 'NOT CONFIRMED', false, 5],
+    ['missing', undefined, 'NOT REPORTED', null, 5],
+    ['null', null, 'NOT REPORTED', null, 5],
+    ['string', 'false', 'NOT REPORTED', null, 5],
+    ['number', 1, 'NOT REPORTED', null, 5],
+    ['object', { started: true }, 'NOT REPORTED', null, 5],
+  ];
+
+  for (const [label, value, expectedStatus, expectedProjectedMarker, expectedConfirmedCount] of cases) {
+    const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), `canary-process-evidence-${label}-`));
+    t.after(() => fs.rmSync(appRoot, { recursive: true, force: true }));
+    const sandbox = producerBoundarySandbox();
+    if (value === undefined) {
+      delete sandbox.codexProcessStarted;
+      delete sandbox.smoke.codexProcessStarted;
+      delete sandbox.probes[0].codexProcessStarted;
+    } else {
+      sandbox.codexProcessStarted = value;
+      sandbox.smoke.codexProcessStarted = value;
+      sandbox.probes[0].codexProcessStarted = value;
+    }
+
+    assert.equal(processStartEvidenceStatus(value), expectedStatus, label);
+    assert.equal(boundaryProbeProcessStartEvidence(sandbox).confirmedCount, expectedConfirmedCount, label);
+    assert.match(formatBoundaryProbeProcessStartEvidence(sandbox), new RegExp(`${expectedConfirmedCount}/6 CONFIRMED; aggregate: ${expectedStatus}`), label);
+    assert.match(formatSmokeProcessStartEvidence(sandbox.smoke), new RegExp(`process-start evidence: ${expectedStatus}`), label);
+
+    const written = writeReport({
+      inventory: syntheticReportInventory(), sandbox, appRoot, assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY,
+    });
+    const detailJson = JSON.parse(fs.readFileSync(written.jsonPath, 'utf8'));
+    const detailText = fs.readFileSync(written.txtPath, 'utf8');
+    const supportJson = JSON.parse(fs.readFileSync(written.supportJsonPath, 'utf8'));
+    const supportText = fs.readFileSync(written.supportTxtPath, 'utf8');
+
+    for (const report of [detailJson, supportJson]) {
+      assert.equal(report.sandbox.processStartEvidence, expectedStatus, `${label} aggregate status`);
+      assert.equal(report.sandbox.smokeProcessStartEvidence, expectedStatus, `${label} smoke status`);
+      assert.equal(report.sandbox.smoke.processStartEvidence, expectedStatus, `${label} smoke object`);
+      assert.equal(report.sandbox.probes[0].processStartEvidence, expectedStatus, `${label} probe status`);
+    }
+    assert.equal(supportJson.sandbox.codexProcessStarted, expectedProjectedMarker, label);
+    assert.equal(supportJson.sandbox.smoke.codexProcessStarted, expectedProjectedMarker, label);
+    assert.equal(supportJson.sandbox.probes[0].codexProcessStarted, expectedProjectedMarker, label);
+    for (const text of [detailText, supportText]) {
+      assert.match(text, new RegExp(`aggregate: ${expectedStatus}`), label);
+      assert.match(text, new RegExp(`Runtime smoke test: PASS; process-start evidence: ${expectedStatus}`), label);
+      assert.match(text, new RegExp(`Process-start evidence: ${expectedStatus}`), label);
+    }
+
+    const summary = summarizeAssessment(detailJson.inventory, detailJson.execpolicy, detailJson.sandbox, {
+      assessmentMode: detailJson.assessmentMode,
+    });
+    assert.equal(summary.boundary, value === true ? 'PASS' : 'TEST ERROR', label);
+  }
+});
+
+test('missing smoke is always reported as not run with process-start evidence not reported', (t) => {
+  const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'canary-missing-smoke-evidence-'));
+  t.after(() => fs.rmSync(appRoot, { recursive: true, force: true }));
+  const sandbox = producerBoundarySandbox();
+  delete sandbox.smoke;
+  const written = writeReport({
+    inventory: syntheticReportInventory(), sandbox, appRoot, assessmentMode: ASSESSMENT_MODES.SANDBOX_ONLY,
+  });
+  const detailJson = JSON.parse(fs.readFileSync(written.jsonPath, 'utf8'));
+  const detailText = fs.readFileSync(written.txtPath, 'utf8');
+  const supportJson = JSON.parse(fs.readFileSync(written.supportJsonPath, 'utf8'));
+  const supportText = fs.readFileSync(written.supportTxtPath, 'utf8');
+
+  for (const report of [detailJson, supportJson]) {
+    assert.equal(report.sandbox.smokeStatus, 'NOT RUN');
+    assert.equal(report.sandbox.smokeProcessStartEvidence, 'NOT REPORTED');
+  }
+  for (const text of [detailText, supportText]) {
+    assert.match(text, /Runtime smoke test:\s+NOT RUN; process-start evidence:\s+NOT REPORTED/);
+    assert.doesNotMatch(text, /Runtime smoke test:\s+NOT RUN; Codex process started:\s+no/i);
+  }
+  assert.equal(summarizeAssessment(detailJson.inventory, detailJson.execpolicy, detailJson.sandbox, {
+    assessmentMode: detailJson.assessmentMode,
+  }).boundary, 'TEST ERROR');
+});
+
 test('boundary cannot pass when every runtime control fails', () => {
   const summary = summarizeAssessment({ config: { warnings: [] } }, [], completedBoundarySandbox({
     codexSource: 'MATCHING_COMPLETE_BUNDLE',
@@ -1383,6 +1887,28 @@ test('confirmed boundary gap remains primary when a sibling probe is a test erro
   assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_NOT_CONFIRMED'), false);
   assert.match(summary.interpretation.join('\n'), /confirmed sandbox boundary gap/i);
   assert.match(summary.interpretation.join('\n'), /additional probe errors.*do not weaken/i);
+});
+
+test('a boundary gap is confirmed only when the affected outside probe has bound process-start evidence', () => {
+  for (const value of [undefined, false, null, 'true', { started: true }]) {
+    const sandbox = completedBoundarySandbox({ probes: completeBoundaryProbes({ gapMethod: 'powershell' }) });
+    const gapProbe = sandbox.probes.find((probe) => probe.method === 'powershell' && probe.location === 'outside');
+    if (value === undefined) delete gapProbe.codexProcessStarted;
+    else gapProbe.codexProcessStarted = value;
+    sandbox.codexProcessStarted = true;
+
+    const summary = summarizeAssessment({ config: { warnings: [] } }, [], sandbox);
+    assert.equal(summary.overall, 'TEST ERROR / INCOMPLETE', String(value));
+    assert.equal(summary.boundary, 'TEST ERROR', String(value));
+    assert.equal(summary.recommendations.some((item) => item.code === 'BOUNDARY_GAP'), false, String(value));
+  }
+
+  const siblingMissing = completedBoundarySandbox({ probes: completeBoundaryProbes({ gapMethod: 'powershell' }) });
+  delete siblingMissing.probes.find((probe) => probe.method === 'node' && probe.location === 'inside').codexProcessStarted;
+  siblingMissing.codexProcessStarted = false;
+  const siblingSummary = summarizeAssessment({ config: { warnings: [] } }, [], siblingMissing);
+  assert.equal(siblingSummary.boundary, 'GAP');
+  assert.equal(siblingSummary.recommendations.some((item) => item.code === 'BOUNDARY_GAP'), true);
 });
 
 test('confirmed boundary gap remains primary with missing method coverage', () => {
@@ -1678,121 +2204,208 @@ test('public documentation avoids absolute share-safe guarantees', () => {
   }
 });
 
-test('public documentation distinguishes Canary Node requirements from Codex CLI requirements', () => {
+test('security documentation bounds approval and require_escalated evidence', () => {
+  const security = fs.readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
+  assert.match(security, /boundary PASS applies only to the sandbox permission profile actually tested/i);
+  assert.match(security, /does not establish whether an approved `require_escalated` command leaves that sandbox context/i);
+  assert.match(security, /which host or credential context such an execution receives/i);
+  assert.match(security, /does not exercise this approval or escalation path/i);
+  assert.match(security, /\[openai\/codex#41161\]\(https:\/\/github\.com\/openai\/codex\/issues\/41161\)/);
+  assert.match(security, /retained only as evidence-boundary context/i);
+  assert.match(security, /does not reproduce or validate that scenario[^.]*not a fix or release-specific claim/i);
+  assert.doesNotMatch(security, /codex-cli\s+\d/i);
+});
+
+test('Alpha 12 run records exist only in changelog and version-specific evidence', () => {
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const faq = fs.readFileSync(new URL('../FAQ.md', import.meta.url), 'utf8');
+  const security = fs.readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
+  const changelog = fs.readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8');
+  const testPlan = fs.readFileSync(new URL('../docs/TEST_PLAN.md', import.meta.url), 'utf8');
+  const evidence = fs.readFileSync(new URL('../docs/evidence/0.1.0-alpha.12.md', import.meta.url), 'utf8');
+
+  for (const document of [readme, faq, security, testPlan]) {
+    assert.doesNotMatch(document, /recorded pre-fix normal-user Windows live run|210\/210|229\/229|33378433400|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/i);
+  }
+  assert.match(changelog, /\[Alpha 12 evidence file\]\(docs\/evidence\/0\.1\.0-alpha\.12\.md\)/);
+  assert.match(testPlan, /\[version-specific evidence\]\(evidence\/\)/);
+  assert.match(evidence, /Recorded pre-fix candidate/i);
+  assert.match(evidence, /78dbabbb0747285a708d540e0044ba9deb87a5f7/);
+  assert.match(evidence, /33378433400/);
+  assert.match(evidence, /abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/);
+  assert.match(evidence, /pre-fix hosted or live evidence does not validate this corrected producer chain/i);
+  assert.match(evidence, /Repeat Windows acceptance: pending/i);
+  assert.match(evidence, /screenshots depict the recorded pre-fix live run/i);
+  assert.match(security, /A sandbox boundary PASS requires a fully completed disposable run\./);
+  assert.match(security, /All six per-probe Codex process-start markers[^.]*derived boundary aggregate[^.]*separate smoke process-start marker[^.]*`CONFIRMED`/i);
+  assert.match(security, /missing evidence is never rewritten as proof that no process started/i);
+  assert.match(faq, /An alternative executable discovered by Guided or Sandbox-only must be explicitly selected and bound to one exact filesystem object before the Canary may run its `--version` command/i);
+  assert.match(faq, /startup smoke command that neither deletes files nor calls a model/i);
+  assert.match(testPlan, /all six per-probe Codex process-start markers are `CONFIRMED`[^.]*derived boundary aggregate is `CONFIRMED`[^.]*separate smoke process-start marker is `CONFIRMED`/i);
+  assert.match(testPlan, /Missing, false, unknown, or contradictory evidence must produce `TEST ERROR \/ INCOMPLETE`/i);
+  assert.match(evidence, /NOT RUN \(0\/6 decisions checked\)/);
+});
+
+
+test('identity failure messages are scoped to the affected sandbox invocation', () => {
+  const source = fs.readFileSync(new URL('../lib/core.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /No sandbox process was started\./);
+  assert.match(source, /affected sandbox invocation was not started because the executable no longer matched the identity bound for that invocation/i);
+  assert.match(source, /affected sandbox invocation was not started because the selected alternative executable no longer matched its explicit selection binding/i);
+});
+
+test('durable public documentation keeps release evidence in the version-specific record', () => {
+  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const faq = fs.readFileSync(new URL('../FAQ.md', import.meta.url), 'utf8');
+  const security = fs.readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
+  const changelog = fs.readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8');
+  const testPlan = fs.readFileSync(new URL('../docs/TEST_PLAN.md', import.meta.url), 'utf8');
+  const evidence = fs.readFileSync(new URL('../docs/evidence/0.1.0-alpha.12.md', import.meta.url), 'utf8');
   const packageJson = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   const workflow = fs.readFileSync(new URL('../.github/workflows/test.yml', import.meta.url), 'utf8');
 
-  assert.doesNotMatch(readme, /compatible Node runtime bundled by Codex|Codex CLI[^.\n]*(?:requires|bundles)[^.\n]*Node\.js/i);
-  assert.match(readme, /Requirements to start the Canary:/);
-  assert.match(readme, /Node\.js 18 or newer in `PATH`[^.]*recognized Codex desktop runtime cache/is);
-  assert.match(readme, /Node\.js 22 or 24 is recommended/i);
-  assert.match(readme, /Node\.js 18 and 20[^.]*end-of-life/i);
-  assert.match(readme, /For the full Codex assessment[^.]*working Codex CLI callable as `codex` is\s+required/is);
-  assert.match(readme, /alternative local executables[^.]*never selects one silently/is);
+  const words = readme.replace(/<[^>]+>/g, ' ').match(/[\p{L}\p{N}][\p{L}\p{N}’'._/-]*/gu) ?? [];
+  const topLevelHeadings = readme.match(/^## .+$/gm) ?? [];
+  assert.ok(words.length <= 1000, `README word count: ${words.length}`);
+  assert.equal(topLevelHeadings.length, 6, `README main headings: ${topLevelHeadings.length}`);
+  for (const required of [
+    /Windows-first local diagnostic[^.]*Codex CLI/i,
+    /This is alpha software\. Its results apply only to the tested setup and do not certify that a computer is secure\./,
+    /synthetic disposable files/i,
+    /never opens, scans, modifies, or deletes real project files/i,
+    /never reads or prints credential contents/i,
+    /does not call a model/i,
+    /not a command blocker, repair mechanism, backup system, or malware scanner/i,
+    /Node\.js 18 or newer through `PATH` or a compatible Node\.js runtime from a recognized Codex desktop runtime cache/i,
+    /Node\.js 22 or 24 is recommended/i,
+    /\[GitHub Releases page\]\(https:\/\/github\.com\/Ann-Diana\/codex-safety-canary\/releases\)/,
+    /\[ZIP help in the FAQ\]\(FAQ\.md#what-should-i-do-if-windows-blocks-the-downloaded-zip\)/,
+    /permission profile/i,
+    /does not validate[^.]*general security of the computer/i,
+    /guarantees neither anonymity nor secrecy/i,
+    /review it manually before public sharing/i,
+    /\[Frequently asked questions\]\(FAQ\.md\)/,
+    /\[Security policy and evidence boundaries\]\(SECURITY\.md\)/,
+    /\[Changelog and release links\]\(CHANGELOG\.md\)/,
+    /\[Repeatable Windows test plan\]\(docs\/TEST_PLAN\.md\)/,
+  ]) assert.match(readme, required);
+  const assessmentModes = readme.slice(
+    readme.indexOf('## Assessment modes'),
+    readme.indexOf('## Understanding results'),
+  );
+  assert.equal((assessmentModes.match(/^- \*\*/gm) ?? []).length, 4);
+  assert.doesNotMatch(assessmentModes, /Report options/i);
+  assert.match(assessmentModes, /active PATH CLI is the default/i);
+  assert.match(assessmentModes, /alternative starts only after that explicit selection/i);
+  assert.match(assessmentModes, /validates only that executable, never the active PATH CLI/i);
+  assert.match(readme, /share-safe reports are designed to remove defined path and configuration categories/i);
+  assert.doesNotMatch(readme, /^##\s+-|^<{7}|^={7}|^>{7}/m);
+  const fenceLines = readme.match(/^```.*$/gm) ?? [];
+  assert.equal(fenceLines.length % 2, 0, 'README code fences must be paired');
+  for (const line of readme.split(/\r?\n/).filter((value) => !value.startsWith('```'))) {
+    assert.equal((line.match(/`/g) ?? []).length % 2, 0, `unpaired inline backtick: ${line}`);
+  }
+  assert.doesNotMatch(readme, /0\.1\.0-alpha\.12|pre-fix|33378433400|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd|codex-cli\s+0\.|docs\/screenshots\//i);
 
-  assert.doesNotMatch(faq, /Why does the Canary mention a bundled Node runtime\?|Node executable bundled inside Codex/i);
-  assert.match(faq, /Why does the Canary mention a Codex desktop runtime\?/i);
-  assert.match(faq, /Canary itself runs on Node\.js/i);
-  assert.match(faq, /normally uses Node\.js from `PATH`/i);
-  assert.match(faq, /recognized Codex desktop runtime cache[^.]*present and executable/is);
-  assert.match(faq, /does not mean that the native Codex CLI generally requires or bundles Node\.js/i);
-  assert.match(faq, /does not imply that `npm` or a system-wide Node\.js installation is available/i);
-  assert.match(faq, /Node\.js 22 or 24 is recommended/i);
-  assert.match(faq, /Node\.js 18 and 20 are end-of-life/i);
+  assert.doesNotMatch(faq, /recorded pre-fix|0\.1\.0-alpha\.12|33378433400|codex-cli\s+0\.|229\/229|210\/210/i);
+  assert.match(faq, /## What should I do if Windows blocks the downloaded ZIP\?/);
+  assert.match(faq, /Properties[^.]*Unblock[^.]*Zulassen[^.]*extract the ZIP again/i);
+  assert.match(faq, /alternative executable discovered by Guided or Sandbox-only must be explicitly selected/i);
+  assert.match(faq, /startup smoke command that neither deletes files nor calls a model/i);
+  assert.match(faq, /Execpolicy is additional user-rule coverage outside the boundary result/i);
+  assert.match(faq, /Share-safe.*risk-reduced[^.]*not anonymous or secret/is);
+
+  assert.match(security, /missing, false, unknown, or contradictory process-start marker[^.]*fails closed/i);
+  assert.match(security, /require_escalated[^.]*host or credential context/is);
+  assert.match(security, /does not exercise this approval or escalation path/i);
+  assert.doesNotMatch(security, /codex-cli\s+\d/i);
+
+  for (const procedure of [
+    /normal user/i,
+    /sandbox command state exactly as `AVAILABLE`/i,
+    /Configuration only/i,
+    /Execpolicy coverage/i,
+    /host deletion preflight/i,
+    /startup smoke/i,
+    /all six per-probe Codex process-start markers/i,
+    /Cleanup/i,
+    /Report consistency checks/i,
+    /Screenshot and video capture checklist/i,
+  ]) assert.match(testPlan, procedure);
+  assert.doesNotMatch(testPlan, /Recorded pre-fix|78dbabbb0747285a708d540e0044ba9deb87a5f7|33378433400|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd|codex-cli\s+0\.|Node\.js\s+`?v\d|Windows\s+`?10\.0/i);
+
+  for (const requiredEvidence of [
+    /78dbabbb0747285a708d540e0044ba9deb87a5f7/,
+    /70348ee7fda0ff578685da385e2f3e36afee5138/,
+    /210\/210/,
+    /229\/229/,
+    /33378433400/,
+    /Windows `10\.0\.26200`/,
+    /Node\.js `v24\.19\.0`/,
+    /codex-cli 0\.151\.0/,
+    /codex-cli 0\.145\.0/,
+    /abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/,
+    /permission profile `:workspace`/,
+    /NOT RUN \(0\/6 decisions checked\)/,
+    /Two alternative executables were discovered but never selected or executed/i,
+    /Hosted CI: pending/i,
+    /Repeat Windows acceptance: pending/i,
+    /does not validate this corrected producer chain/i,
+  ]) assert.match(evidence, requiredEvidence);
+  assert.match(changelog, /Alpha 12 evidence file/i);
 
   assert.equal(packageJson.engines.node, '>=18');
   assert.match(workflow, /node-version:\s*\[18, 20, 22, 24\]/);
 });
 
-test('README references all twelve authoritative screenshots exactly once with result-oriented alt text', () => {
-  const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
-  const screenshots = [
-    ['01-main-menu.png', 'Codex Safety Canary main menu with guided assessment, configuration review, execpolicy coverage and disposable Windows sandbox test options'],
-    ['04-guided-live-probes-declined.png', 'Guided assessment completed with live probes declined, reporting PARTIAL / LIVE PROBES DECLINED, sandbox boundary NOT TESTED and runtime pairs NOT TESTED'],
-    ['05-execpolicy-coverage-test.png', 'Execpolicy coverage results for PowerShell Remove-Item, the PowerShell 7 wrapper, cmd.exe del, Node.js fs.rmSync, Git clean and Git reset, reported separately from the sandbox boundary'],
-    ['08-executable-selection.png', 'Selection between the active PATH CLI and a separate newer Codex executable, with the sandbox result explicitly limited to the selected executable'],
-    ['09-alternative-bundle-boundary-pass.png', 'Separate Codex executable passing PowerShell, cmd.exe and Node.js sandbox boundary probes with complete three-of-three runtime coverage while the active PATH CLI remains NOT TESTED'],
-    ['02-sandbox-only-declined.png', 'Sandbox-only assessment declined before live probes, with sandbox boundary and runtime pairs reported as NOT TESTED'],
-    ['03-sandbox-only-report-dialog.png', 'Detailed Canary report showing the active CLI resource layout and its sandbox boundary as NOT TESTED'],
-    ['06-share-safe-support-report.png', 'Share-safe support report with local usernames, absolute paths, credential paths and raw configuration removed while diagnostic version, installation, runtime and security-status information is retained for manual review'],
-    ['07-share-safe-badge.png', 'Share-safe support notice listing removed local usernames, absolute local paths, credential paths and raw configuration, retained diagnostic versions and security status, and the requirement to review before public sharing'],
-    ['10-alpha12-menu.png', 'Rendered Alpha 12 Canary menu for version 0.1.0-alpha.12, derived from verified evidence rather than a raw live capture'],
-    ['11-alpha12-boundary-pass.png', 'Rendered Alpha 12 boundary PASS for active PATH CLI codex-cli 0.151.0 with complete three-of-three runtime coverage under the tested :workspace profile'],
-    ['12-alpha12-share-safe-report.png', 'Rendered Alpha 12 share-safe support excerpt with the anonymity and secrecy warning and manual public-sharing review reminder'],
+test('release screenshots live in evidence and relative documentation links resolve', () => {
+  const repositoryRoot = fileURLToPath(new URL('../', import.meta.url));
+  const documentPaths = [
+    'README.md',
+    'FAQ.md',
+    'SECURITY.md',
+    'CHANGELOG.md',
+    'docs/TEST_PLAN.md',
+    'docs/evidence/0.1.0-alpha.12.md',
   ];
-  const screenshotAlts = Object.fromEntries(screenshots);
-  const screenshotHeadings = [
-    '### Safe guided assessment',
-    '### Executable selection and bounded evidence',
-    '### Sandbox-only decline and detailed report',
-    '### Share-safe support output',
+  const documents = Object.fromEntries(documentPaths.map((relativePath) => [
+    relativePath,
+    fs.readFileSync(path.join(repositoryRoot, relativePath), 'utf8'),
+  ]));
+  const readme = documents['README.md'];
+  const evidence = documents['docs/evidence/0.1.0-alpha.12.md'];
+  const releaseScreenshots = [
+    '10-alpha12-menu.png',
+    '11-alpha12-boundary-pass.png',
+    '12-alpha12-share-safe-report.png',
   ];
-  assert.equal(readme.split(/\r?\n/, 1)[0], '# Codex Safety Canary');
-  assert.equal(readme.includes('Codex security has several layers with different jobs:'), false);
-  assert.equal(readme.split('docs/screenshots/').length - 1, screenshots.length);
-  for (const [name, alt] of screenshots) {
-    const relativePath = `docs/screenshots/${name}`;
-    assert.equal(readme.split(relativePath).length - 1, 1, relativePath);
-    assert.equal(readme.includes(`src="${relativePath}" alt="${alt}"`), true, name);
-    assert.equal(fs.existsSync(new URL(`../${relativePath}`, import.meta.url)), true, name);
-    const normalizedAlt = alt.toLowerCase();
-    for (const forbidden of ['no environment-specific information', 'anonymous', 'environment-free']) {
-      assert.equal(normalizedAlt.includes(forbidden), false, `${name}: ${forbidden}`);
+
+  assert.equal(readme.split(/docs\/screenshots\//i).length - 1, 0);
+  assert.match(evidence, /screenshots depict the recorded pre-fix live run/i);
+  assert.match(evidence, /not final release evidence for the process-evidence-corrected candidate/i);
+  for (const name of releaseScreenshots) {
+    const relativePath = `../screenshots/${name}`;
+    assert.equal(evidence.split(relativePath).length - 1, 1, name);
+    assert.equal(fs.existsSync(path.resolve(repositoryRoot, 'docs', 'evidence', relativePath)), true, name);
+  }
+
+  for (const [relativeDocumentPath, document] of Object.entries(documents)) {
+    const targets = [
+      ...[...document.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].map((match) => match[1]),
+      ...[...document.matchAll(/\b(?:src|href)="([^"]+)"/g)].map((match) => match[1]),
+    ];
+    for (const target of targets) {
+      if (/^(?:[a-z][a-z0-9+.-]*:|#)/i.test(target)) continue;
+      const localTarget = decodeURIComponent(target.split('#', 1)[0]);
+      assert.equal(
+        fs.existsSync(path.resolve(repositoryRoot, path.dirname(relativeDocumentPath), localTarget)),
+        true,
+        `${relativeDocumentPath}: ${target}`,
+      );
     }
   }
-  assert.equal(readme.includes('alpha11-screenshot-overview.png'), false);
-  assert.equal(readme.includes('![]('), false);
-  const orderedPositions = screenshots.map(([name]) => readme.indexOf(`docs/screenshots/${name}`));
-  assert.deepEqual([...orderedPositions].sort((left, right) => left - right), orderedPositions);
-  const headingPositions = screenshotHeadings.map((heading) => {
-    assert.equal(readme.split(heading).length - 1, 1, heading);
-    return readme.indexOf(heading);
-  });
-  assert.deepEqual([...headingPositions].sort((left, right) => left - right), headingPositions);
-  const narrativeAnchors = [
-    '01-main-menu.png',
-    screenshotHeadings[0],
-    '04-guided-live-probes-declined.png',
-    '05-execpolicy-coverage-test.png',
-    screenshotHeadings[1],
-    '08-executable-selection.png',
-    '09-alternative-bundle-boundary-pass.png',
-    screenshotHeadings[2],
-    '02-sandbox-only-declined.png',
-    '03-sandbox-only-report-dialog.png',
-    screenshotHeadings[3],
-    '06-share-safe-support-report.png',
-    '07-share-safe-badge.png',
-  ];
-  const narrativePositions = narrativeAnchors.map((anchor) => readme.indexOf(anchor));
-  assert.deepEqual([...narrativePositions].sort((left, right) => left - right), narrativePositions);
-  assert.equal(screenshotAlts['02-sandbox-only-declined.png'].includes('NOT TESTED'), true);
-  assert.equal(screenshotAlts['03-sandbox-only-report-dialog.png'].includes('NOT TESTED'), true);
-  assert.equal(screenshotAlts['04-guided-live-probes-declined.png'].includes('PARTIAL'), true);
-  assert.equal(screenshotAlts['04-guided-live-probes-declined.png'].includes('NOT TESTED'), true);
-  for (const commandForm of ['PowerShell Remove-Item', 'PowerShell 7 wrapper', 'cmd.exe del', 'Node.js fs.rmSync', 'Git clean', 'Git reset']) {
-    assert.equal(screenshotAlts['05-execpolicy-coverage-test.png'].includes(commandForm), true, commandForm);
-  }
-  assert.equal(screenshotAlts['06-share-safe-support-report.png'].includes('removed'), true);
-  assert.equal(screenshotAlts['06-share-safe-support-report.png'].includes('retained'), true);
-  assert.match(screenshotAlts['07-share-safe-badge.png'], /review before public sharing/i);
-  assert.match(screenshotAlts['08-executable-selection.png'], /limited to the selected executable/i);
-  assert.match(screenshotAlts['09-alternative-bundle-boundary-pass.png'], /three-of-three.*active PATH CLI remains NOT TESTED/i);
-  assert.match(readme, /Rendered from verified Alpha 12 evidence[^.]*codex-cli 0\.151\.0[^.]*Windows `10\.0\.26200`[^.]*Node\.js `v24\.19\.0`[^.]*normal non-administrator[^.]*`:workspace`[^.]*not a raw live capture\./i);
-  assert.match(screenshotAlts['11-alpha12-boundary-pass.png'], /codex-cli 0\.151\.0.*three-of-three.*:workspace/i);
-  assert.match(screenshotAlts['12-alpha12-share-safe-report.png'], /anonymity and secrecy.*public-sharing review/i);
-  assert.doesNotMatch(readme, /safe by construction/i);
-  assert.equal(readme.includes('Boundary-test validity'), false);
-  assert.doesNotMatch(readme, /run folder is removed after the report is written/i);
-  assert.match(readme, /run folder is cleaned up before the final reports are written[^.]*structured cleanup status[^.]*every report format/i);
-  const topLevelHeadings = readme.match(/^## .+$/gm) ?? [];
-  assert.equal(topLevelHeadings.at(-1), '## License');
-  const licenseSection = readme.slice(readme.lastIndexOf('## License'));
-  assert.equal(licenseSection.includes('[LICENSE](LICENSE)'), true);
-  assert.equal(fs.existsSync(new URL('../LICENSE', import.meta.url)), true);
 });
+
 
 test('all eighteen public PNGs are structurally valid and free of metadata-bearing chunks', () => {
   const docsRoot = fileURLToPath(new URL('../docs/', import.meta.url));
@@ -1801,7 +2414,7 @@ test('all eighteen public PNGs are structurally valid and free of metadata-beari
   assert.equal(pngFiles.length, 18);
   const allowedChunks = new Set(['IHDR', 'PLTE', 'IDAT', 'IEND', 'sRGB', 'gAMA', 'pHYs']);
   const forbiddenChunks = new Set(['caBX', 'eXIf', 'iCCP', 'iTXt', 'tEXt', 'zTXt']);
-  const forbiddenMetadataText = ['ann-d', 'c:\\users', 'appdata', 'c2pa', 'jumbf', 'openai-media-service', 'urn:uuid', '-----begin'];
+  const forbiddenMetadataText = ['synthetic-local-user', 'private-test-user', 'c:\\users', 'appdata', 'c2pa', 'jumbf', 'openai-media-service', 'urn:uuid', '-----begin'];
   for (const file of pngFiles) {
     const chunks = readPngChunks(file);
     for (const chunk of chunks) {
@@ -2137,16 +2750,14 @@ test('manual acceptance documentation matches skipped Doctor and the actual repo
   const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   const faq = fs.readFileSync(new URL('../FAQ.md', import.meta.url), 'utf8');
   const security = fs.readFileSync(new URL('../SECURITY.md', import.meta.url), 'utf8');
-  const changelog = fs.readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8');
   const testPlan = fs.readFileSync(new URL('../docs/TEST_PLAN.md', import.meta.url), 'utf8');
-  const documents = [readme, faq, security, changelog, testPlan];
 
-  for (const document of documents) {
+  for (const document of [faq, security, testPlan]) {
     assert.match(document, /Doctor[^\n]*NOT_RUN|NOT_RUN[^\n]*Doctor/i);
     assert.doesNotMatch(document, /codex doctor[^.\n]*(?:remains|is|as) (?:non-blocking )?read-only evidence/i);
   }
-  assert.equal(readme.includes('The detailed text report opens automatically in Notepad.'), false);
-  assert.match(readme, /report dialog[^.]*does not open the detailed report automatically[^.]*press `O`/is);
+  assert.match(readme, /does not start `codex doctor`/i);
+  assert.match(readme, /Reports open only when selected from the report dialog or menu/i);
 
   const configurationSection = testPlan.slice(
     testPlan.indexOf('## Test 1 – Configuration only'),
@@ -2911,7 +3522,7 @@ test('successful smoke confirms runtime startup but not sandbox boundary pass by
     smoke: { passed: true, codexProcessStarted: true }, probes: [],
   }, { execpolicyRun: false });
   assert.equal(summary.sandboxRuntime, 'READY');
-  assert.equal(summary.boundary, 'NOT TESTED');
+  assert.equal(summary.boundary, 'TEST ERROR');
   assert.equal(summary.activeCli.bundleStatus, 'STANDALONE RESOURCES PRESENT – HELPER RESOLUTION CONFIRMED');
   assert.equal(summary.activeCli.helperResolution, 'CONFIRMED');
   assert.equal(summary.activeCli.runtimeStartup, 'READY');
@@ -3122,6 +3733,7 @@ test('standalone executable identity change before execution fails closed withou
     versionMismatch: plan.versionMismatch,
     testedBundleMetadata: plan.testedBundleMetadata,
     standaloneResourceBinding: plan.standaloneResourceBinding,
+    executableRunBinding: plan.executableRunBinding,
   });
   assert.equal(sandbox.status, 'SETUP_FAILED');
   assert.equal(sandbox.setupFailureCode, 'EXECUTABLE_IDENTITY_MISMATCH');
@@ -3670,11 +4282,22 @@ test('skipped Doctor remains non-permissive and consistent across detailed and s
 });
 
 function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, probes = [] } = {}) {
+  const marker = 'synthetic-alternative-boundary-run';
+  const boundProbes = probes.map((probe) => ({
+    ...probe,
+    id: `${probe.location}-workspace-${probe.method}`,
+    targetId: `${probe.location}-workspace-${probe.method}`,
+    reportedRuntime: probe.method,
+    codexProcessStarted: true,
+    runMarker: marker,
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+  }));
   return {
     status,
     codexSource: 'NEWER_COMPLETE_BUNDLE',
     codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
-    codexProcessStarted: true,
+    codexProcessStarted: status === 'COMPLETED' && boundProbes.length === 6,
+    marker,
     testedCodexVersion: 'codex-cli 0.146.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: true,
@@ -3703,7 +4326,7 @@ function alternativeStandaloneSandbox({ status = 'COMPLETED', error = null, prob
     cleanup: status === 'COMPLETED'
       ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
       : { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null },
-    probes,
+    probes: boundProbes,
     error,
   };
 }
@@ -3826,10 +4449,22 @@ test('generic sandbox setup diagnosis is suppressed independently for each targe
 });
 
 function matchingAlternativeSandbox({ status = 'COMPLETED', probes = [], error = null } = {}) {
+  const marker = 'synthetic-matching-alternative-boundary-run';
+  const boundProbes = probes.map((probe) => ({
+    ...probe,
+    id: `${probe.location}-workspace-${probe.method}`,
+    targetId: `${probe.location}-workspace-${probe.method}`,
+    reportedRuntime: probe.method,
+    codexProcessStarted: true,
+    runMarker: marker,
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+  }));
   return {
     status,
     codexSource: 'MATCHING_COMPLETE_BUNDLE',
-    codexProcessStarted: true,
+    codexExecutableIdentity: TESTED_EXECUTABLE_IDENTITY,
+    codexProcessStarted: status === 'COMPLETED' && boundProbes.length === 6,
+    marker,
     testedCodexVersion: 'codex-cli 0.145.0',
     activeCodexVersion: 'codex-cli 0.145.0',
     versionMismatch: false,
@@ -3849,7 +4484,7 @@ function matchingAlternativeSandbox({ status = 'COMPLETED', probes = [], error =
     cleanup: status === 'COMPLETED'
       ? { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false, message: 'Synthetic cleanup completed.' }
       : { status: 'NOT_RUN', attempted: false, completed: false, errorPresent: false, message: null },
-    probes,
+    probes: boundProbes,
     error,
   };
 }

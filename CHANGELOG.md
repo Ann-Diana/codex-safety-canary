@@ -4,43 +4,31 @@
 
 ### Added
 
-- Adds versioned, offline synthetic regression fixtures for `openai/codex#28457`, `openai/codex#36179`, `openai/codex#41135`, and `openai/codex#41278`, including affected-version metadata, expected states, and explicit evidence boundaries.
-- Reports execpolicy command form, exact rule-path binding, observed host resolution, and execution binding as separate facts in detailed and share-safe output.
-- Extends the configured Windows and Ubuntu CI matrix with Node.js 24 while retaining the declared Node.js 18 minimum and existing 18, 20, and 22 compatibility rows.
+- Adds versioned offline regressions for current-CLI split installations and upstream watcher and process-evidence boundaries.
+- Reports execpolicy command form, rule-path binding, observed host resolution, and execution binding as separate facts in detailed and share-safe output.
+- Extends the configured Windows and Ubuntu CI matrix with Node.js 24.
 
 ### Changed
 
-- Requires the active inventory diagnostics or the explicitly selected alternative's own post-selection diagnostics to verify the same general `codex sandbox [OPTIONS] [COMMAND]...` contract used for any later live invocation.
-- Evaluates multiple known explicit execpolicy decisions independently of order with the strictest decision winning, while unknown values and unsupported structures remain fail-closed.
-- Binds helper and command-runner runtime evidence to the exact selected executable identity in addition to its component and runtime stage.
-- Retains the existing share-safe JSON `sandboxCommandSyntax` field as a compatibility alias while adding the semantically precise sandbox state and command-contract fields.
 - Removes implicit `codex doctor --json` execution from every Canary mode. Available CLIs report Doctor as `NOT_RUN`, unavailable CLIs as `UNAVAILABLE`, and no Doctor-derived diagnostics are claimed.
-- Aligns the manual acceptance plan with the actual report dialog and with Configuration-only inventory, which has no executable-selection step.
-- Restricts alternative executables to filesystem-only inventory until an explicit Guided or Sandbox-only selection is bound to one provable identity; only then may that executable run `--version` and `sandbox --help` diagnostics.
-- Labels package-derived alternative versions as metadata rather than executable output and keeps unselected alternatives `NOT_SELECTED`, `NOT_RUN`, and not tested across console and all report formats.
-- Rejects unparseable executed versions and package-metadata conflicts before `sandbox --help`, while preserving metadata-derived and execution-confirmed versions as separate report fields.
-- Documents the four per-run report artifacts plus the local `latest.json` management pointer, which contains absolute paths and is not share-safe.
+- Restricts alternative executables to filesystem-only inventory until an explicit Guided or Sandbox-only selection is bound to a provable identity.
+- Requires complete, executable-bound process-start evidence for every boundary probe and for the separate startup smoke before a boundary `PASS`.
+- Keeps console, detailed, and share-safe report projections consistent while preserving `NOT REPORTED` and `null` for missing evidence.
+- Reorganizes README, FAQ, SECURITY, and the test plan around durable document roles and moves release-specific results into a single evidence file.
 
 ### Security
 
-- Preserves the complete structured `3/3` boundary matrix, smoke, host calibration, target-bound denial, structured cleanup, alternative-executable scoping, and share-safe redaction invariants.
-- Keeps package resources and any synthetic historical Doctor fixture evidence separate from helper resolution, runtime startup, and boundary proof; no fixture, help output, policy match, skipped diagnostic, or alternative executable can establish a PASS for the active CLI.
-- Limits the Canary's `auth.json` handling to an existence check and avoids Doctor-driven authentication, app, session, network, or update diagnostics.
-- Revalidates the explicit selection binding for classic and standalone alternatives before every Codex sandbox subprocess; aliases to the active executable are not run as independent candidates, while unproven identities fail closed.
-- Requires a stat-backed filesystem-object identity for selection, treats realpath-only evidence as unproven, and never labels a candidate as a tested bundle when identity validation blocks the first sandbox process.
+- Preserves fail-closed matrix, smoke, host-calibration, target-binding, cleanup, executable-selection, and share-safe invariants.
+- Keeps offline fixtures, package resources, skipped diagnostics, and execpolicy classifications separate from runtime and boundary proof.
 
 ### Validation
 
-- Validated `npm test` with 210/210 passing tests on Windows and Node.js `v24.19.0`, including the focused alternative-inventory, wrapper-start, identity-binding, version-evidence, process-start, report-state, and upstream-fixture regressions; `npm run check` and `git diff --check` also completed successfully.
-- Completed a normal-user Windows live run with Canary `0.1.0-alpha.12` on Windows `10.0.26200` and Node.js `v24.19.0` against the active PATH CLI `codex-cli 0.151.0` (`ACTIVE_CLI`): resource layout `COMPLETE`, helper resolution `CONFIRMED`, runtime startup `READY`, and smoke `PASS`.
-- PowerShell, cmd.exe, and Node.js host calibration each passed; the complete boundary matrix was `3/3`, boundary `PASS`, and cleanup `COMPLETED`.
-- The preceding active PATH CLI `codex-cli 0.145.0` run stopped at `SANDBOX_SETUP_HELPER_NOT_RESOLVED` and produced no boundary verdict.
-- The PASS applies only to the tested Codex version, installation, configuration, and `:workspace` permission-profile run. Execpolicy coverage was separately `0/6`, additional rule coverage outside the boundary verdict. Two alternative executables were discovered but never selected or executed, and Codex doctor was not started.
-- No hosted CI matrix run was performed for this candidate.
+- The process-evidence-corrected candidate passes the local automated and static checks. Hosted CI and repeat Windows acceptance remain pending.
+- Candidate identities, test counts, hosted-matrix results, live-run conditions, report hashes, screenshots, and remaining evidence gaps are recorded in the [Alpha 12 evidence file](docs/evidence/0.1.0-alpha.12.md).
 
 ### Known limitations
 
-- The versioned offline fixtures for `openai/codex#28457`, `openai/codex#36179`, `openai/codex#41135`, and `openai/codex#41278` preserve known synthetic evidence boundaries; they do not prove a current live defect or a current live fix.
+- Versioned offline fixtures preserve synthetic evidence boundaries; they do not prove a current live defect or fix.
 - The Canary is local diagnostics, not a command blocker, automatic repair mechanism, general safety claim, or security certification.
 - Share-safe output reduces disclosure risk but guarantees neither anonymity nor secrecy and still requires manual review before sharing.
 
@@ -118,7 +106,7 @@
 ### Changed
 
 - Uses asynchronous, error-aware report opening for Notepad and Explorer without claiming success before process start.
-- Clarifies `:workspace` permission-profile wording in console and detailed reports.
+- Clarifies `:workspace` permission profile wording in console and detailed reports.
 - Keeps local review inputs and local diff artifacts out of release and source-control inputs.
 
 ## 0.1.0-alpha.8 – 2026-07-25
@@ -139,7 +127,7 @@
 
 ### Changed
 
-- Uses the current `codex sandbox` permission-profile interface: `--permission-profile :workspace --cd <workspace>`.
+- Uses the current `codex sandbox` permission profile interface: `--permission-profile :workspace --cd <workspace>`.
 - Tests PowerShell, `cmd.exe`, and Node.js as matched inside/outside runtime pairs.
 - Reports a full pass only when every tested runtime can delete inside the workspace and is denied outside it.
 - Reports incomplete or inconclusive runtime matrices without treating successful individual methods as a boundary verdict.
@@ -182,7 +170,7 @@
 - Search only the known local Codex installation roots for complete alternative bundles.
 - Compare bundle versions and offer a same-version complete bundle for disposable live probes when the active CLI bundle is incomplete.
 - Require explicit user consent before using an alternative bundle and record the exact executable in TXT and JSON reports.
-- Run a harmless sandbox smoke test before any deletion probe.
+- Run a non-deleting, non-model startup smoke command before any deletion probe.
 - Distinguish sandbox command availability, runtime setup, boundary results, and inside-workspace behavior.
 
 ### Fixed

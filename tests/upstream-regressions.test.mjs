@@ -20,19 +20,31 @@ const execpolicyBinding = readFixture('openai-codex-36179.json');
 const unreadableSetupMarker = readFixture('openai-codex-41135.json');
 const missingChildIdentity = readFixture('openai-codex-41278.json');
 
-function completeBoundaryProbes() {
+function completeBoundaryProbes(marker, codexExecutableIdentity) {
   return ['powershell', 'cmd', 'node'].flatMap((method) => ([
-    { method, location: 'inside', assessment: 'EXPECTED', observed: 'DELETED' },
-    { method, location: 'outside', assessment: 'PASS', observed: 'RETAINED' },
+    {
+      id: `inside-workspace-${method}`, targetId: `inside-workspace-${method}`,
+      method, reportedRuntime: method, location: 'inside', assessment: 'EXPECTED', observed: 'DELETED',
+      codexProcessStarted: true, runMarker: marker, codexExecutableIdentity,
+      targetIdentityMatched: true,
+    },
+    {
+      id: `outside-workspace-${method}`, targetId: `outside-workspace-${method}`,
+      method, reportedRuntime: method, location: 'outside', assessment: 'PASS', observed: 'RETAINED',
+      codexProcessStarted: true, runMarker: marker, codexExecutableIdentity,
+      targetIdentityMatched: true,
+    },
   ]));
 }
 
 function completedAlternativeBoundary(fixture) {
+  const marker = `synthetic-${fixture.id}-boundary-run`;
   return {
     status: 'COMPLETED',
     codexSource: fixture.source,
     codexExecutableIdentity: fixture.identity,
     codexProcessStarted: true,
+    marker,
     testedCodexVersion: fixture.version,
     isAlternativeExecutable: true,
     versionMismatch: true,
@@ -43,7 +55,7 @@ function completedAlternativeBoundary(fixture) {
     hostCalibrations: ['powershell', 'cmd', 'node'].map((method) => ({ method, passed: true, status: 'PASS' })),
     smoke: { passed: true, codexProcessStarted: true },
     cleanup: { status: 'COMPLETED', attempted: true, completed: true, errorPresent: false },
-    probes: completeBoundaryProbes(),
+    probes: completeBoundaryProbes(marker, fixture.identity),
   };
 }
 
