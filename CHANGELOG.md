@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-alpha.12 – Unreleased
+## 0.1.0-alpha.12 – 2026-09-04
 
 ### Added
 
