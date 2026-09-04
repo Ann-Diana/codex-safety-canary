@@ -2225,7 +2225,7 @@ test('Alpha 12 run records exist only in changelog and version-specific evidence
   const evidence = fs.readFileSync(new URL('../docs/evidence/0.1.0-alpha.12.md', import.meta.url), 'utf8');
 
   for (const document of [readme, faq, security, testPlan]) {
-    assert.doesNotMatch(document, /recorded pre-fix normal-user Windows live run|210\/210|229\/229|33378433400|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/i);
+    assert.doesNotMatch(document, /recorded pre-fix normal-user Windows live run|210\/210|229\/229|33378433400|33913510379|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/i);
   }
   assert.match(changelog, /\[Alpha 12 evidence file\]\(docs\/evidence\/0\.1\.0-alpha\.12\.md\)/);
   assert.match(testPlan, /\[version-specific evidence\]\(evidence\/\)/);
@@ -2236,7 +2236,10 @@ test('Alpha 12 run records exist only in changelog and version-specific evidence
   assert.match(evidence, /pre-fix hosted or live evidence does not validate this corrected producer chain/i);
   assert.match(evidence, /Repeat Windows acceptance: completed for this commit and tree/i);
   assert.match(evidence, /The repeat normal-user Windows acceptance tested exactly product commit `1d71e8687c40a7e62a468df6bb93995f992f80d2` and tree `f43769c99813d9828d1f7fa721b07aa2923c819c`/i);
-  assert.match(evidence, /Hosted CI: pending/i);
+  assert.match(evidence, /Hosted CI: completed for PR head `a973f31af2c8d6d2891106f52afd9dd70dbd3941` in \[Test run `33913510379`\]/i);
+  assert.match(evidence, /Ubuntu with Node\.js 18, 20, 22, and 24: 229 tests, 228 passed, 1 intentional Windows-specific skip, and 0 failed in each job/i);
+  assert.match(evidence, /Windows with Node\.js 18, 20, 22, and 24: 229 tests, 229 passed, 0 skipped, and 0 failed in each job/i);
+  assert.match(evidence, /\[CodeQL run `33913508605`\]\(https:\/\/github\.com\/Ann-Diana\/codex-safety-canary\/actions\/runs\/33913508605\) targeted the same PR head/i);
   assert.match(evidence, /The later documentation commit that records this evidence was not itself live-tested/i);
   assert.match(evidence, /screenshots depict the recorded pre-fix live run/i);
   assert.match(security, /A sandbox boundary PASS requires a fully completed disposable run\./);
@@ -2335,7 +2338,7 @@ test('durable public documentation keeps release evidence in the version-specifi
     /Report consistency checks/i,
     /Screenshot and video capture checklist/i,
   ]) assert.match(testPlan, procedure);
-  assert.doesNotMatch(testPlan, /Recorded pre-fix|78dbabbb0747285a708d540e0044ba9deb87a5f7|33378433400|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd|codex-cli\s+0\.|Node\.js\s+`?v\d|Windows\s+`?10\.0/i);
+  assert.doesNotMatch(testPlan, /Recorded pre-fix|78dbabbb0747285a708d540e0044ba9deb87a5f7|33378433400|33913510379|abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd|codex-cli\s+0\.|Node\.js\s+`?v\d|Windows\s+`?10\.0/i);
 
   for (const requiredEvidence of [
     /78dbabbb0747285a708d540e0044ba9deb87a5f7/,
@@ -2343,6 +2346,7 @@ test('durable public documentation keeps release evidence in the version-specifi
     /210\/210/,
     /229\/229/,
     /33378433400/,
+    /33913510379/,
     /Windows `10\.0\.26200`/,
     /Node\.js `v24\.19\.0`/,
     /codex-cli 0\.151\.0/,
@@ -2351,7 +2355,9 @@ test('durable public documentation keeps release evidence in the version-specifi
     /permission profile `:workspace`/,
     /NOT RUN \(0\/6 decisions checked\)/,
     /Two alternative executables were discovered but never selected or executed/i,
-    /Hosted CI: pending/i,
+    /Hosted CI: completed for PR head `a973f31af2c8d6d2891106f52afd9dd70dbd3941`/i,
+    /Ubuntu with Node\.js 18, 20, 22, and 24: 229 tests, 228 passed, 1 intentional Windows-specific skip, and 0 failed in each job/i,
+    /Windows with Node\.js 18, 20, 22, and 24: 229 tests, 229 passed, 0 skipped, and 0 failed in each job/i,
     /Repeat Windows acceptance: completed for this commit and tree/i,
     /The repeat normal-user Windows acceptance tested exactly product commit `1d71e8687c40a7e62a468df6bb93995f992f80d2` and tree `f43769c99813d9828d1f7fa721b07aa2923c819c`/i,
     /The later documentation commit that records this evidence was not itself live-tested/i,

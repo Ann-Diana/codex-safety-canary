@@ -23,7 +23,7 @@
 
 ### Validation
 
-- The process-evidence-corrected candidate passed the local automated and static checks and the repeat normal-user Windows acceptance recorded for commit `1d71e8687c40a7e62a468df6bb93995f992f80d2`. Hosted CI remains pending.
+- The process-evidence-corrected candidate passed the local automated and static checks and the repeat normal-user Windows acceptance recorded for commit `1d71e8687c40a7e62a468df6bb93995f992f80d2`. Hosted CI for PR head `a973f31af2c8d6d2891106f52afd9dd70dbd3941` completed successfully across the configured Windows, Ubuntu, and Node.js 18, 20, 22, and 24 matrix.
 - Candidate identities, test counts, hosted-matrix results, live-run conditions, report hashes, screenshots, and remaining evidence gaps are recorded in the [Alpha 12 evidence file](docs/evidence/0.1.0-alpha.12.md).
 
 ### Known limitations
