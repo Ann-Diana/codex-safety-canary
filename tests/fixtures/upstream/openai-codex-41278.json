@@ -1,0 +1,38 @@
+{
+  "fixtureSchemaVersion": 1,
+  "id": "openai-codex-41278",
+  "issue": {
+    "repository": "openai/codex",
+    "number": 41278,
+    "url": "https://github.com/openai/codex/issues/41278"
+  },
+  "knownAffectedVersions": ["0.149.1", "0.150.1"],
+  "capturedOn": "2026-08-31",
+  "evidenceBoundary": [
+    "The fixture uses synthetic process state and does not execute Codex or change credentials, accounts, ACLs, or sandbox setup.",
+    "A started process with exit code 1 and no child identity or completion marker does not prove the effective sandbox identity or runtime readiness.",
+    "The Windows 10 22H2 issue-bound evidence does not contradict the separate successful 0.151.0 run on Windows 10.0.26200 and does not establish a fix."
+  ],
+  "syntheticInput": {
+    "activeCli": {
+      "source": "ACTIVE_CLI",
+      "identity": "fixture-active-codex-0.150.1-no-child-marker",
+      "version": "codex-cli 0.150.1"
+    },
+    "sandboxProcess": {
+      "started": true,
+      "exitCode": 1,
+      "stdoutEof": true,
+      "stderrEof": true,
+      "childIdentityMarkerObserved": false,
+      "completionMarkerObserved": false
+    },
+    "expected": {
+      "helperResolution": "NOT_TESTED",
+      "runtimeStartup": "FAILED",
+      "sandboxRuntime": "FAILED",
+      "boundary": "TEST ERROR",
+      "overall": "TEST ERROR / INCOMPLETE"
+    }
+  }
+}

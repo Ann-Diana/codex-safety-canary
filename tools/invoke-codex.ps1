@@ -6,6 +6,7 @@ try {
         $codexExe = "codex"
     }
     & $codexExe @args
+    [Console]::Error.WriteLine("__CODEX_SAFETY_CANARY_EXECUTABLE_STARTED__")
     if ($null -eq $LASTEXITCODE) {
         exit 0
     }

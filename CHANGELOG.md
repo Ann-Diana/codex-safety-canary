@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.1.0-alpha.12 – 2026-09-04
+
+### Added
+
+- Adds versioned offline regressions for current-CLI split installations and upstream watcher and process-evidence boundaries.
+- Reports execpolicy command form, rule-path binding, observed host resolution, and execution binding as separate facts in detailed and share-safe output.
+- Extends the configured Windows and Ubuntu CI matrix with Node.js 24.
+
+### Changed
+
+- Removes implicit `codex doctor --json` execution from every Canary mode. Available CLIs report Doctor as `NOT_RUN`, unavailable CLIs as `UNAVAILABLE`, and no Doctor-derived diagnostics are claimed.
+- Restricts alternative executables to filesystem-only inventory until an explicit Guided or Sandbox-only selection is bound to a provable identity.
+- Requires complete, executable-bound process-start evidence for every boundary probe and for the separate startup smoke before a boundary `PASS`.
+- Keeps console, detailed, and share-safe report projections consistent while preserving `NOT REPORTED` and `null` for missing evidence.
+- Reorganizes README, FAQ, SECURITY, and the test plan around durable document roles and moves release-specific results into a single evidence file.
+
+### Security
+
+- Preserves fail-closed matrix, smoke, host-calibration, target-binding, cleanup, executable-selection, and share-safe invariants.
+- Keeps offline fixtures, package resources, skipped diagnostics, and execpolicy classifications separate from runtime and boundary proof.
+
+### Validation
+
+- The process-evidence-corrected candidate passed the local automated and static checks and the repeat normal-user Windows acceptance recorded for commit `1d71e8687c40a7e62a468df6bb93995f992f80d2`. Hosted CI for PR head `a973f31af2c8d6d2891106f52afd9dd70dbd3941` completed successfully across the configured Windows, Ubuntu, and Node.js 18, 20, 22, and 24 matrix.
+- Candidate identities, test counts, hosted-matrix results, live-run conditions, report hashes, screenshots, and remaining evidence gaps are recorded in the [Alpha 12 evidence file](docs/evidence/0.1.0-alpha.12.md).
+
+### Known limitations
+
+- Versioned offline fixtures preserve synthetic evidence boundaries; they do not prove a current live defect or fix.
+- The Canary is local diagnostics, not a command blocker, automatic repair mechanism, general safety claim, or security certification.
+- Share-safe output reduces disclosure risk but guarantees neither anonymity nor secrecy and still requires manual review before sharing.
+
 ## 0.1.0-alpha.11 – 2026-08-01
 
 ### Added
@@ -16,7 +48,7 @@
 - Derives standalone aliases from normalized visible discovery paths, preserving `current` while excluding the representative direct release path consistently across Windows Node.js 18, 20, and 22.
 - Runs the complete operating-system and Node.js CI matrix without fail-fast cancellation so every supported combination reports its result.
 - Keeps the active PATH CLI and every separately selected executable as independent diagnostic targets across console, TXT, JSON, and share-safe reports; same-version and newer alternative results apply only to the selected executable.
-- Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result; `codex doctor --json` remains non-blocking read-only evidence.
+- Carries runtime failures observed during `codex sandbox --help` inventory into reports without treating a successful help command as a smoke, runtime, or boundary result. Alpha 11 also invoked `codex doctor --json` during inventory; the unreleased candidate removes that implicit call instead of assuming a guaranteed local, offline, or read-only contract.
 - Writes full Sandbox-only reports when live probes are unavailable, while keeping unavailable, explicitly declined, and intentionally unassessed outcomes distinct.
 
 ### Security
@@ -74,7 +106,7 @@
 ### Changed
 
 - Uses asynchronous, error-aware report opening for Notepad and Explorer without claiming success before process start.
-- Clarifies `:workspace` permission-profile wording in console and detailed reports.
+- Clarifies `:workspace` permission profile wording in console and detailed reports.
 - Keeps local review inputs and local diff artifacts out of release and source-control inputs.
 
 ## 0.1.0-alpha.8 – 2026-07-25
@@ -95,7 +127,7 @@
 
 ### Changed
 
-- Uses the current `codex sandbox` permission-profile interface: `--permission-profile :workspace --cd <workspace>`.
+- Uses the current `codex sandbox` permission profile interface: `--permission-profile :workspace --cd <workspace>`.
 - Tests PowerShell, `cmd.exe`, and Node.js as matched inside/outside runtime pairs.
 - Reports a full pass only when every tested runtime can delete inside the workspace and is denied outside it.
 - Reports incomplete or inconclusive runtime matrices without treating successful individual methods as a boundary verdict.
@@ -138,7 +170,7 @@
 - Search only the known local Codex installation roots for complete alternative bundles.
 - Compare bundle versions and offer a same-version complete bundle for disposable live probes when the active CLI bundle is incomplete.
 - Require explicit user consent before using an alternative bundle and record the exact executable in TXT and JSON reports.
-- Run a harmless sandbox smoke test before any deletion probe.
+- Run a non-deleting, non-model startup smoke command before any deletion probe.
 - Distinguish sandbox command availability, runtime setup, boundary results, and inside-workspace behavior.
 
 ### Fixed
