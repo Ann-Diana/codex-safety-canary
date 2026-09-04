@@ -2234,7 +2234,10 @@ test('Alpha 12 run records exist only in changelog and version-specific evidence
   assert.match(evidence, /33378433400/);
   assert.match(evidence, /abc18a9241fa86e4852477ff1e291bb9aa3e5df9bdb779c8d3ef4c72e6fd07dd/);
   assert.match(evidence, /pre-fix hosted or live evidence does not validate this corrected producer chain/i);
-  assert.match(evidence, /Repeat Windows acceptance: pending/i);
+  assert.match(evidence, /Repeat Windows acceptance: completed for this commit and tree/i);
+  assert.match(evidence, /The repeat normal-user Windows acceptance tested exactly product commit `1d71e8687c40a7e62a468df6bb93995f992f80d2` and tree `f43769c99813d9828d1f7fa721b07aa2923c819c`/i);
+  assert.match(evidence, /Hosted CI: pending/i);
+  assert.match(evidence, /The later documentation commit that records this evidence was not itself live-tested/i);
   assert.match(evidence, /screenshots depict the recorded pre-fix live run/i);
   assert.match(security, /A sandbox boundary PASS requires a fully completed disposable run\./);
   assert.match(security, /All six per-probe Codex process-start markers[^.]*derived boundary aggregate[^.]*separate smoke process-start marker[^.]*`CONFIRMED`/i);
@@ -2349,7 +2352,9 @@ test('durable public documentation keeps release evidence in the version-specifi
     /NOT RUN \(0\/6 decisions checked\)/,
     /Two alternative executables were discovered but never selected or executed/i,
     /Hosted CI: pending/i,
-    /Repeat Windows acceptance: pending/i,
+    /Repeat Windows acceptance: completed for this commit and tree/i,
+    /The repeat normal-user Windows acceptance tested exactly product commit `1d71e8687c40a7e62a468df6bb93995f992f80d2` and tree `f43769c99813d9828d1f7fa721b07aa2923c819c`/i,
+    /The later documentation commit that records this evidence was not itself live-tested/i,
     /does not validate this corrected producer chain/i,
   ]) assert.match(evidence, requiredEvidence);
   assert.match(changelog, /Alpha 12 evidence file/i);
